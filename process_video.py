@@ -10,7 +10,7 @@ mp_drawing_styles = mp.solutions.drawing_styles
 mp_pose = mp.solutions.pose.Pose()
 
 # Load font for annotations
-FONT_PATH = "/System/Library/Fonts/Supplemental/Times New Roman.ttf"
+FONT_PATH = "/System/Library/Fonts/Supplemental/Arial.ttf"
 FONT_SIZE = 20
 font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
 
@@ -32,8 +32,9 @@ def detect_pose(frame):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return mp_pose.process(rgb_frame)
 
+
 def render_pose_landmarks(frame, landmarks):
-    """Draw pose landmarks on the frame."""
+    """Draw Mediapipe skeleton on the frame."""
     mp_drawing.draw_landmarks(
         frame,
         landmarks,
@@ -48,7 +49,7 @@ def render_joint_angles(frame, landmarks, angles):
 
     frame_width, frame_height = frame.shape[1], frame.shape[0]
     for joint, angle in angles.items():
-        joint_index = POSE_LANDMARKS[joint]  # Map joint name to Mediapipe landmark index
+        joint_index = POSE_LANDMARKS[joint]
         joint_coords = landmarks[joint_index]
         joint_x = int(joint_coords.x * frame_width)
         joint_y = int(joint_coords.y * frame_height)
@@ -58,14 +59,15 @@ def render_joint_angles(frame, landmarks, angles):
 
 def process_frame(frame):
     """Process a single frame: detect pose, calculate angles, and overlay annotations."""
-    results = detect_pose(frame)
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = mp_pose.process(rgb_frame)
 
     if not results.pose_landmarks:
         return frame
 
     landmarks = results.pose_landmarks.landmark
 
-    # Draw landmarks
+    # Draw skeleton
     render_pose_landmarks(frame, results.pose_landmarks)
 
     # Calculate joint angles
