@@ -1,8 +1,16 @@
+import os
 import cv2
 import mediapipe as mp
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from backend.utils import ( get_subject_bbox, calculate_joint_angles, POSE_LANDMARKS, clean_up_file)
+from backend.utils import (
+    get_subject_bbox,
+    calculate_joint_angles,
+    POSE_LANDMARKS,
+    clean_up_file,
+    capture_screenshots,
+    save_screenshot_metadata,
+)
 
 # Initialize Mediapipe components
 mp_drawing = mp.solutions.drawing_utils
@@ -63,7 +71,7 @@ def process_frame(frame):
     results = mp_pose.process(rgb_frame)
 
     if not results.pose_landmarks:
-        return frame
+        return frame, None
 
     landmarks = results.pose_landmarks.landmark
 
@@ -76,12 +84,21 @@ def process_frame(frame):
     # Overlay joint angles
     frame = render_joint_angles(frame, landmarks, angles)
 
-    return frame
+    return frame, angles
 
 def process_video_pipeline(input_path, output_path):
-    """Orchestrates video processing: read, process frames, and write output."""
+    """Orchestrates video processing: read, process frames, write output, and save screenshots."""
+    # Initialize video capture and writer
     cap, frame_width, frame_height, fps = read_video(input_path)
     out = write_video(output_path, frame_width, frame_height, fps)
+
+    # Prepare screenshot directory
+    base_filename = os.path.splitext(os.path.basename(input_path))[0].replace("processed_", "")
+    screenshot_folder = os.path.join("backend", "testing", base_filename, "screenshots")
+    os.makedirs(screenshot_folder, exist_ok=True)
+
+    joint_data = {}
+    frame_count = 0
 
     try:
         while cap.isOpened():
@@ -89,8 +106,31 @@ def process_video_pipeline(input_path, output_path):
             if not ret:
                 break
 
-            processed_frame = process_frame(frame)
+            # Process the frame for pose detection and annotations
+            processed_frame, angles = process_frame(frame)
+
+            if angles:
+                # Collect joint data for screenshots
+                joint_data[frame_count] = angles
+
+            # Write processed frame to the video
             out.write(processed_frame)
+            frame_count += 1
+
+        # Capture screenshots and generate metadata
+        screenshot_metadata = capture_screenshots(
+            video_path=input_path,
+            joint_data=joint_data,
+            output_folder=os.path.join("backend", "testing", base_filename),
+            interval_seconds=5  # Take a screenshot every 5 seconds
+        )
+
+        # Save screenshot metadata
+        save_screenshot_metadata(screenshot_metadata, os.path.join("backend", "testing", base_filename))
+
+        print(f"Processing complete. Processed video saved to: {output_path}")
+        print(f"Screenshots and metadata saved to: {os.path.join('backend', 'testing', base_filename)}")
+
     finally:
         cap.release()
         out.release()
