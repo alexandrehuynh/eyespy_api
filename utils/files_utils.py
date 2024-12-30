@@ -17,3 +17,8 @@ def generate_unique_filename(original_filename, output_folder=None, use_uuid=Fal
     if output_folder:
         return os.path.join(output_folder, filename)
     return filename
+
+def save_file(file_content, destination_path):
+    """Save binary file content to a specified destination."""
+    with open(destination_path, "wb") as f:
+        f.write(file_content)
