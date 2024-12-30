@@ -8,6 +8,7 @@ from utils import (
     get_subject_bbox,
     get_table_dimensions,
     adjust_table_position,
+    draw_table_on_frame,
     clean_up_file,
 )
 
@@ -20,7 +21,7 @@ def process_video(input_path, output_path):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, cap.get(cv2.CAP_PROP_FPS),
                           (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                           (int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))))
+                           int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))))
 
     # Load a TrueType font for Pillow
     font_path = "/System/Library/Fonts/Supplemental/Times New Roman.ttf"
@@ -38,7 +39,6 @@ def process_video(input_path, output_path):
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = mp_pose.process(rgb_frame)
 
-            bbox = None
             if results.pose_landmarks:
                 landmarks = results.pose_landmarks.landmark
 
@@ -73,15 +73,8 @@ def process_video(input_path, output_path):
                 table_width, table_height = get_table_dimensions(frame_width, frame_height)
                 table_x, table_y = adjust_table_position(bbox, frame_width, frame_height, table_width, table_height)
 
-                # Draw table background
-                draw.rectangle([(table_x, table_y), (table_x + table_width, table_y + table_height)], fill=(0, 0, 0))
-                draw.text((table_x + 5, table_y + 5), "Joint    Angle", font=font, fill=(255, 255, 255))
-
-                # Populate table with joint angles
-                table_row_y = table_y + 30
-                for joint, angle in angles.items():
-                    draw.text((table_x + 5, table_row_y), f"{joint:<12} {int(angle)}°", font=font, fill=(255, 255, 255))
-                    table_row_y += 20
+                # Draw the table on the frame
+                draw_table_on_frame(draw, font, angles, table_x, table_y)
 
                 # Convert back to OpenCV format
                 frame = cv2.cvtColor(np.array(frame_pil), cv2.COLOR_RGB2BGR)
