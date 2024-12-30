@@ -1,9 +1,15 @@
-import os
 import cv2
 import mediapipe as mp
 import numpy as np
-from utils.pose_landmarks import calculate_joint_angles, POSE_LANDMARKS
 from PIL import Image, ImageDraw, ImageFont
+from utils import (
+    calculate_joint_angles,
+    POSE_LANDMARKS,
+    get_subject_bbox,
+    get_table_dimensions,
+    adjust_table_position,
+    clean_up_file,
+)
 
 def process_video(input_path, output_path):
     mp_drawing = mp.solutions.drawing_utils
@@ -14,11 +20,11 @@ def process_video(input_path, output_path):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, cap.get(cv2.CAP_PROP_FPS),
                           (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                           int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))))
+                           (int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))))
 
     # Load a TrueType font for Pillow
-    font_path = "/System/Library/Fonts/Supplemental/Times New Roman.ttf"  # Use a compatible .ttf font
-    font = ImageFont.truetype(font_path, 20)  # Font size can be adjusted dynamically
+    font_path = "/System/Library/Fonts/Supplemental/Times New Roman.ttf"
+    font = ImageFont.truetype(font_path, 20)
 
     try:
         while cap.isOpened():
@@ -26,12 +32,18 @@ def process_video(input_path, output_path):
             if not ret:
                 break
 
+            frame_height, frame_width, _ = frame.shape
+
             # Process frame with Mediapipe
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = mp_pose.process(rgb_frame)
 
+            bbox = None
             if results.pose_landmarks:
                 landmarks = results.pose_landmarks.landmark
+
+                # Get subject bounding box
+                bbox = get_subject_bbox(landmarks, frame_width, frame_height)
 
                 # Draw pose landmarks
                 mp_drawing.draw_landmarks(
@@ -48,28 +60,28 @@ def process_video(input_path, output_path):
                 frame_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 draw = ImageDraw.Draw(frame_pil)
 
-                # Overlay small angle symbols and numbers near joints
+                # Overlay angles near joints
                 for joint, angle in angles.items():
                     if joint in POSE_LANDMARKS:
                         joint_index = POSE_LANDMARKS[joint]
-                        if joint_index >= len(landmarks) or landmarks[joint_index].visibility < 0.5:
-                            continue  # Skip joints that are not visible
-
                         joint_coords = landmarks[joint_index]
-                        joint_x = int(joint_coords.x * frame.shape[1])
-                        joint_y = int(joint_coords.y * frame.shape[0])
-
-                        # Draw angle symbol near the joint
+                        joint_x = int(joint_coords.x * frame_width)
+                        joint_y = int(joint_coords.y * frame_height)
                         draw.text((joint_x + 10, joint_y - 10), f"∠{int(angle)}°", font=font, fill=(255, 255, 0))
 
-                # Display angle table in the top-right corner
-                start_x, start_y = 10, 20  # Starting position for the table
-                draw.rectangle([(start_x, start_y), (start_x + 200, start_y + 20 * (len(angles) + 2))], fill=(0, 0, 0))
-                draw.text((start_x + 5, start_y + 5), "Joint    Angle", font=font, fill=(255, 255, 255))
-                table_y = start_y + 30
+                # Set table size and position
+                table_width, table_height = get_table_dimensions(frame_width, frame_height)
+                table_x, table_y = adjust_table_position(bbox, frame_width, frame_height, table_width, table_height)
+
+                # Draw table background
+                draw.rectangle([(table_x, table_y), (table_x + table_width, table_y + table_height)], fill=(0, 0, 0))
+                draw.text((table_x + 5, table_y + 5), "Joint    Angle", font=font, fill=(255, 255, 255))
+
+                # Populate table with joint angles
+                table_row_y = table_y + 30
                 for joint, angle in angles.items():
-                    draw.text((start_x + 5, table_y), f"{joint:<12} {int(angle)}°", font=font, fill=(255, 255, 255))
-                    table_y += 20
+                    draw.text((table_x + 5, table_row_y), f"{joint:<12} {int(angle)}°", font=font, fill=(255, 255, 255))
+                    table_row_y += 20
 
                 # Convert back to OpenCV format
                 frame = cv2.cvtColor(np.array(frame_pil), cv2.COLOR_RGB2BGR)
@@ -80,5 +92,4 @@ def process_video(input_path, output_path):
         out.release()
 
         # Clean up the uploaded file
-        if os.path.exists(input_path):
-            os.remove(input_path)
+        clean_up_file(input_path)

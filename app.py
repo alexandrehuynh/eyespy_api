@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 import os
 from process_video import process_video  
-from datetime import datetime
+from utils import generate_unique_filename
 
 app = FastAPI()
 
@@ -11,12 +11,6 @@ PROCESSED_DIR = "processed/"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
-
-def generate_unique_filename(original_name):
-    """Generate a unique filename using the current timestamp."""
-    timestamp = datetime.now().strftime("%m%d%Y_%H%M%S")  # MMDDYYYY_HHMMSS
-    name, ext = original_name.rsplit(".", 1)
-    return f"{name}_{timestamp}.{ext}"
 
 @app.post("/process-video/")
 async def process_video_endpoint(file: UploadFile = File(...)):
