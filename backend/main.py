@@ -1,8 +1,8 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 import os
-from process_video import process_video_pipeline
-from utils import ( generate_unique_filename, save_file, clean_up_file )
+from backend.routes.process_video import process_video_pipeline
+from backend.utils import ( generate_unique_filename, save_file, clean_up_file )
 
 app = FastAPI()
 

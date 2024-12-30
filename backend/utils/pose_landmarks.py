@@ -1,4 +1,4 @@
-from calculations import calculate_angle
+from backend.services.calculations import calculate_angle
 
 POSE_LANDMARKS = {
     "left_shoulder": 11,

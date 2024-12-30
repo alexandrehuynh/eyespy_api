@@ -2,7 +2,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from utils import ( get_subject_bbox, calculate_joint_angles, POSE_LANDMARKS, clean_up_file)
+from backend.utils import ( get_subject_bbox, calculate_joint_angles, POSE_LANDMARKS, clean_up_file)
 
 # Initialize Mediapipe components
 mp_drawing = mp.solutions.drawing_utils
