@@ -88,16 +88,17 @@ def process_frame(frame):
 
 def process_video_pipeline(input_path, output_path):
     """Orchestrates video processing: read, process frames, write output, and save screenshots."""
-    # Initialize video capture and writer
     cap, frame_width, frame_height, fps = read_video(input_path)
     out = write_video(output_path, frame_width, frame_height, fps)
 
-    # Prepare screenshot directory
+    mp_pose = mp.solutions.pose.Pose()
+
     base_filename = os.path.splitext(os.path.basename(input_path))[0].replace("processed_", "")
     screenshot_folder = os.path.join("backend", "testing", base_filename, "screenshots")
     os.makedirs(screenshot_folder, exist_ok=True)
 
     joint_data = {}
+    processed_frames = {}  # Store annotated frames for screenshots
     frame_count = 0
 
     try:
@@ -110,8 +111,10 @@ def process_video_pipeline(input_path, output_path):
             processed_frame, angles = process_frame(frame)
 
             if angles:
-                # Collect joint data for screenshots
                 joint_data[frame_count] = angles
+
+            # Store processed frame
+            processed_frames[frame_count] = processed_frame
 
             # Write processed frame to the video
             out.write(processed_frame)
@@ -120,9 +123,10 @@ def process_video_pipeline(input_path, output_path):
         # Capture screenshots and generate metadata
         screenshot_metadata = capture_screenshots(
             video_path=input_path,
+            processed_frames=processed_frames,  # Pass annotated frames
             joint_data=joint_data,
             output_folder=os.path.join("backend", "testing", base_filename),
-            interval_seconds=5  # Take a screenshot every 5 seconds
+            interval_seconds=4  # Take a screenshot every 4 seconds
         )
 
         # Save screenshot metadata
@@ -132,6 +136,6 @@ def process_video_pipeline(input_path, output_path):
         print(f"Screenshots and metadata saved to: {os.path.join('backend', 'testing', base_filename)}")
 
     finally:
+        mp_pose.close()  # Release Mediapipe resources
         cap.release()
         out.release()
-        clean_up_file(input_path)

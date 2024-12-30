@@ -8,56 +8,37 @@ def get_fps(video_path):
     cap.release()
     return fps if fps > 0 else 30  # Default to 30 FPS if FPS is invalid
 
-def capture_screenshots(video_path, joint_data, output_folder, interval_seconds=5):
+def capture_screenshots(video_path, processed_frames, joint_data, output_folder, interval_seconds=4):
     """
-    Captures screenshots based on selected frames and generates metadata.
-    
+    Captures screenshots from processed frames with Mediapipe landmarks and annotations.
+
     Args:
         video_path (str): Path to the input video file.
-        joint_data (dict): Dictionary containing joint data for each frame.
+        processed_frames (dict): Dictionary of annotated frames keyed by frame number.
+        joint_data (dict): Joint data for each frame.
         output_folder (str): Folder to save screenshots and metadata.
         interval_seconds (int): Interval in seconds between selected frames.
-    
+
     Returns:
         dict: Metadata for screenshots including filenames, frame numbers, timestamps, and joint data.
     """
-    # Create output subfolder for screenshots
     screenshots_folder = os.path.join(output_folder, "screenshots")
     os.makedirs(screenshots_folder, exist_ok=True)
 
-    # Open the video
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video file: {video_path}")
-    
-    # Get video properties
-    fps = get_fps(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+
+    frame_interval = int(fps * interval_seconds)
     frame_metadata = []
 
-    # Determine frame selection
-    selected_frames = select_frames(total_frames, fps, interval_seconds=interval_seconds)
-
-    frame_number = 0
-    while frame_number < total_frames:
-        if frame_number in selected_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
-            ret, frame = cap.read()
-            if not ret:
-                break
-
+    for frame_number, processed_frame in processed_frames.items():
+        if frame_number % frame_interval == 0:
             timestamp = frame_number / fps
             screenshot_name = f"frame_{frame_number:03d}.png"
             screenshot_path = os.path.join(screenshots_folder, screenshot_name)
+            cv2.imwrite(screenshot_path, processed_frame)
 
-            # Save the screenshot
-            try:
-                cv2.imwrite(screenshot_path, frame)
-            except Exception as e:
-                print(f"Error saving screenshot {screenshot_name}: {e}")
-                continue
-
-            # Add metadata for the screenshot, including all joint data
             metadata = {
                 "file_name": screenshot_name,
                 "frame_number": frame_number,
@@ -66,9 +47,6 @@ def capture_screenshots(video_path, joint_data, output_folder, interval_seconds=
             }
             frame_metadata.append(metadata)
 
-        frame_number += int(fps * interval_seconds)
-
-    cap.release()
     return {"screenshots": frame_metadata}
 
 def select_frames(total_frames, fps, interval_seconds=5):
