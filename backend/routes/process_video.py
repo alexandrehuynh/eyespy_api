@@ -123,10 +123,10 @@ def process_video_pipeline(input_path, output_path):
         # Capture screenshots and generate metadata
         screenshot_metadata = capture_screenshots(
             video_path=input_path,
-            processed_frames=processed_frames,  # Pass annotated frames
+            processed_frames=processed_frames,  # Pass frames with angles and skeletons
             joint_data=joint_data,
             output_folder=os.path.join("backend", "testing", base_filename),
-            interval_seconds=4  # Take a screenshot every 4 seconds
+            interval_seconds=4
         )
 
         # Save screenshot metadata
