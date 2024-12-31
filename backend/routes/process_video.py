@@ -94,7 +94,7 @@ def process_video_pipeline(input_path, output_path):
     mp_pose = mp.solutions.pose.Pose()
 
     base_filename = os.path.splitext(os.path.basename(input_path))[0].replace("processed_", "")
-    screenshot_folder = os.path.join("backend", "testing", base_filename, "screenshots")
+    screenshot_folder = os.path.join("project_test_tools", "test_data", base_filename, "screenshots")
     os.makedirs(screenshot_folder, exist_ok=True)
 
     joint_data = {}
@@ -125,15 +125,15 @@ def process_video_pipeline(input_path, output_path):
             video_path=input_path,
             processed_frames=processed_frames,  # Pass frames with angles and skeletons
             joint_data=joint_data,
-            output_folder=os.path.join("backend", "testing", base_filename),
+            output_folder=os.path.join("project_test_tools", "test_data", base_filename),
             interval_seconds=4
         )
 
         # Save screenshot metadata
-        save_screenshot_metadata(screenshot_metadata, os.path.join("backend", "testing", base_filename))
+        save_screenshot_metadata(screenshot_metadata, os.path.join("project_test_tools", "test_data", base_filename))
 
         print(f"Processing complete. Processed video saved to: {output_path}")
-        print(f"Screenshots and metadata saved to: {os.path.join('backend', 'testing', base_filename)}")
+        print(f"Screenshots and metadata saved to: {os.path.join('project_test_tools', 'test_data', base_filename)}")
 
     finally:
         mp_pose.close()  # Release Mediapipe resources
