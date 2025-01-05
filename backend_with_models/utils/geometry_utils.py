@@ -1,3 +1,18 @@
+import numpy as np
+
+def calculate_angle(point1, point2, point3):
+    """Calculate the angle formed at point2 by point1 and point3."""
+    vector1 = np.array(point1) - np.array(point2)
+    vector2 = np.array(point3) - np.array(point2)
+    dot_product = np.dot(vector1, vector2)
+    magnitude = np.linalg.norm(vector1) * np.linalg.norm(vector2)
+    angle = np.arccos(dot_product / magnitude)
+    return np.degrees(angle)
+
+def calculate_deviation(reference_line, point):
+    """Calculate deviation of a point from a reference line."""
+    return abs(point[0] - reference_line[0])  # Example for vertical deviation
+
 def get_subject_bbox(landmarks, frame_width, frame_height):
     """
     Calculate bounding box for the detected subject.
