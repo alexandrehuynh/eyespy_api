@@ -33,7 +33,7 @@ def calculate_angle(a, b, c):
     return angle
 
 def process_video(input_path: Path, output_path: Path):
-    """Process the video, overlay landmarks and angles, and save the result."""
+    """Process the video, overlay landmarks, angles, skeleton, dashed lines, and shaded areas."""
     cap = cv2.VideoCapture(str(input_path))
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(str(output_path), fourcc, int(cap.get(cv2.CAP_PROP_FPS)), 
@@ -51,61 +51,94 @@ def process_video(input_path: Path, output_path: Path):
             image.flags.writeable = True
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
+            height, width, _ = image.shape
+
             if results.pose_landmarks:
-                # Draw pose landmarks
+                # Draw Mediapipe skeleton
                 mp_drawing.draw_landmarks(
-                    image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=2),
-                    mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=2),
+                    image,
+                    results.pose_landmarks,
+                    mp_pose.POSE_CONNECTIONS,
+                    mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=4),  # Joint points
+                    mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2, circle_radius=2),  # Connections
                 )
 
-                # Extract landmarks
                 landmarks = results.pose_landmarks.landmark
 
-                # Get coordinates for specific joints
-                # Upper body (shoulder-elbow-wrist)
-                shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x,
-                            landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
-                elbow = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x,
-                         landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y]
-                wrist = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x,
-                         landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y]
+                # Key points
+                left_shoulder = np.array([
+                    landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x * width,
+                    landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y * height
+                ])
+                right_shoulder = np.array([
+                    landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x * width,
+                    landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y * height
+                ])
+                left_hip = np.array([
+                    landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x * width,
+                    landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y * height
+                ])
+                right_hip = np.array([
+                    landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x * width,
+                    landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y * height
+                ])
+                left_elbow = np.array([
+                    landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x * width,
+                    landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y * height
+                ])
+                left_wrist = np.array([
+                    landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x * width,
+                    landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y * height
+                ])
+                left_knee = np.array([
+                    landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x * width,
+                    landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y * height
+                ])
+                left_ankle = np.array([
+                    landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].x * width,
+                    landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y * height
+                ])
 
-                # Lower body (hip-knee-ankle)
-                hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x,
-                       landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
-                knee = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x,
-                        landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y]
-                ankle = [landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].x,
-                         landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y]
+                # Midpoints for spine alignment
+                mid_shoulders = (left_shoulder + right_shoulder) / 2
+                mid_hips = (left_hip + right_hip) / 2
 
-                # Spine alignment (shoulder-hip-knee)
-                spine_top = shoulder
-                spine_mid = hip
-                spine_bottom = knee
+                # Solid lines for pose structure
+                cv2.line(image, tuple(left_shoulder.astype(int)), tuple(right_shoulder.astype(int)), (255, 0, 0), 2)  # Shoulders
+                cv2.line(image, tuple(left_hip.astype(int)), tuple(right_hip.astype(int)), (0, 0, 255), 2)  # Hips
+                cv2.line(image, tuple(mid_shoulders.astype(int)), tuple(mid_hips.astype(int)), (0, 255, 0), 2)  # Spine
 
-                # Calculate angles
-                elbow_angle = calculate_angle(shoulder, elbow, wrist)
-                knee_angle = calculate_angle(hip, knee, ankle)
-                hip_angle = calculate_angle(shoulder, hip, knee)
-                spine_angle = calculate_angle(spine_top, spine_mid, spine_bottom)
+                # Dashed vertical reference line
+                for i in range(0, height, 20):
+                    cv2.line(image, (int(width / 2), i), (int(width / 2), i + 10), (0, 255, 255), 2)
 
-                # Visualize angles
-                cv2.putText(image, f'Elbow: {int(elbow_angle)}',
-                            tuple(np.multiply(elbow, [image.shape[1], image.shape[0]]).astype(int)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+                # Dashed lines extending the spine
+                for i in range(0, int(np.linalg.norm(mid_shoulders - mid_hips)), 20):
+                    start = mid_shoulders + i * (mid_hips - mid_shoulders) / np.linalg.norm(mid_shoulders - mid_hips)
+                    end = mid_shoulders + (i + 10) * (mid_hips - mid_shoulders) / np.linalg.norm(mid_shoulders - mid_hips)
+                    cv2.line(image, tuple(start.astype(int)), tuple(end.astype(int)), (0, 255, 255), 2)
 
-                cv2.putText(image, f'Knee: {int(knee_angle)}',
-                            tuple(np.multiply(knee, [image.shape[1], image.shape[0]]).astype(int)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+                # # Green shaded triangle for deviation visualization
+                # deviation_vector = mid_shoulders - mid_hips
+                # deviation_end = mid_shoulders + np.array([0, np.linalg.norm(deviation_vector)])
+                # points = np.array([mid_hips, mid_shoulders, deviation_end], dtype=np.int32)
+                # cv2.fillPoly(image, [points], color=(0, 255, 0, 50))
 
-                cv2.putText(image, f'Hip: {int(hip_angle)}',
-                            tuple(np.multiply(hip, [image.shape[1], image.shape[0]]).astype(int)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+                # Joint angle calculations
+                elbow_angle = calculate_angle(left_shoulder, left_elbow, left_wrist)
+                knee_angle = calculate_angle(left_hip, left_knee, left_ankle)
+                hip_angle = calculate_angle(left_shoulder, left_hip, left_knee)
+                spine_angle = calculate_angle(left_shoulder, left_hip, left_knee)
 
-                cv2.putText(image, f'Spine: {int(spine_angle)}',
-                            tuple(np.multiply(hip, [image.shape[1] + 50, image.shape[0] - 50]).astype(int)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2, cv2.LINE_AA)
+                # Display joint angles
+                cv2.putText(image, f'Elbow: {int(elbow_angle)}°', tuple(left_elbow.astype(int)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                cv2.putText(image, f'Knee: {int(knee_angle)}°', tuple(left_knee.astype(int)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                cv2.putText(image, f'Hip: {int(hip_angle)}°', tuple(left_hip.astype(int)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                cv2.putText(image, f'Spine: {int(spine_angle)}°', (int(left_hip[0]) + 50, int(left_hip[1]) - 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
             # Write the processed frame
             out.write(image)
