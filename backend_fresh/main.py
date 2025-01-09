@@ -7,7 +7,7 @@ from collections import deque
 from fastapi.responses import FileResponse
 from datetime import datetime
 from mediapipe.python.solutions.pose import POSE_CONNECTIONS
-
+from mediapipe.framework.formats.landmark_pb2 import NormalizedLandmarkList
 
 app = FastAPI()
 
@@ -135,7 +135,7 @@ async def process_video(file: UploadFile = File(...)):
                 if left_elbow_angle is not None:
                     cv2.putText(
                         frame,
-                        f"Elbow: {int(left_elbow_angle)}\u00B0",
+                        f"Elbow: {int(left_elbow_angle)}",
                         tuple(np.array(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value][:2], dtype=int)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
@@ -145,7 +145,7 @@ async def process_video(file: UploadFile = File(...)):
                 if left_knee_angle is not None:
                     cv2.putText(
                         frame,
-                        f"Knee: {int(left_knee_angle)}\u00B0",
+                        f"Knee: {int(left_knee_angle)}",
                         tuple(np.array(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value][:2], dtype=int)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
@@ -155,7 +155,7 @@ async def process_video(file: UploadFile = File(...)):
                 if left_hip_angle is not None:
                     cv2.putText(
                         frame,
-                        f"Hip: {int(left_hip_angle)}\u00B0",
+                        f"Hip: {int(left_hip_angle)}",
                         tuple(np.array(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value][:2], dtype=int)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
@@ -168,17 +168,37 @@ async def process_video(file: UploadFile = File(...)):
                 right_hip = np.array(smoothed_landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value][:2])
                 pelvis_origin = (left_hip + right_hip) / 2
 
-                # Draw 3D axes at the pelvis origin
+                # Draw extended and semi-transparent 3D axes at the pelvis origin
                 origin_x, origin_y = int(pelvis_origin[0]), int(pelvis_origin[1])
-                cv2.line(frame, (origin_x, origin_y), (origin_x + 50, origin_y), (0, 0, 255), 3)  # X-axis (Red)
-                cv2.line(frame, (origin_x, origin_y), (origin_x, origin_y - 50), (0, 255, 0), 3)  # Y-axis (Green)
-                cv2.line(frame, (origin_x, origin_y), (origin_x, origin_y + 50), (255, 0, 0), 3)  # Z-axis (Blue)
+                overlay = frame.copy()
+
+                # Extended axes
+                x_length, y_length, z_length = 500, 500, 500  # Extend line lengths
+                cv2.line(overlay, (origin_x, origin_y), (origin_x + x_length, origin_y), (0, 0, 255), 3)  # X-axis (Red)
+                cv2.line(overlay, (origin_x, origin_y), (origin_x, origin_y - y_length), (0, 255, 0), 3)  # Y-axis (Green)
+                cv2.line(overlay, (origin_x, origin_y), (origin_x, origin_y + z_length), (255, 0, 0), 3)  # Z-axis (Blue)
+
+                # Apply opacity to axes
+                alpha = 0.5  # Opacity level
+                frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+                # Create a filtered landmark list without facial landmarks
+                filtered_landmarks = NormalizedLandmarkList()
+                filtered_landmarks.landmark.extend(
+                    [lm for i, lm in enumerate(results.pose_landmarks.landmark) if i >= 11]
+                )
+
+                # Remap connections for the filtered landmarks
+                adjusted_connections = [
+                    (start - 11, end - 11) for start, end in POSE_CONNECTIONS
+                    if start >= 11 and end >= 11  # Only keep connections for landmarks 11+
+                ]
 
                 # Draw landmarks and connections excluding facial landmarks
                 mp_drawing.draw_landmarks(
                     frame,
-                    results.pose_landmarks,  # Use the full landmark set
-                    CUSTOM_POSE_CONNECTIONS,  # Use filtered connections
+                    filtered_landmarks,  # Use the filtered landmark set
+                    adjusted_connections,  # Use the remapped connections
                     mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=4),
                     mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2, circle_radius=2),
                 )
