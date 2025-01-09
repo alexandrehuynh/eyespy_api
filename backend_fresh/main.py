@@ -5,6 +5,9 @@ import numpy as np
 from pathlib import Path
 from collections import deque
 from fastapi.responses import FileResponse
+from datetime import datetime
+from mediapipe.python.solutions.pose import POSE_CONNECTIONS
+
 
 app = FastAPI()
 
@@ -21,6 +24,12 @@ PROCESSED_FOLDER.mkdir(exist_ok=True)
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
+# Define custom pose connections (excluding face)
+CUSTOM_POSE_CONNECTIONS = set([
+    connection for connection in POSE_CONNECTIONS
+    if connection[0] >= 11 and connection[1] >= 11  # Keep only body-related connections (landmarks 11+)
+])
+
 # Constants for smoothing and motion trails
 SMOOTHING_WINDOW = 5
 MOTION_TRAIL_LENGTH = 10
@@ -36,10 +45,46 @@ def smooth_landmarks(landmarks, history, index):
         return landmarks  # Not enough data for smoothing
     return np.mean(history[index], axis=0)
 
+def calculate_angle(a, b, c):
+    """
+    Calculate the angle between three points in 3D space.
+    a, b, c are points represented as [x, y, z].
+    Returns the angle in degrees.
+    """
+    if a is None or b is None or c is None:
+        return None  # Skip if any point is missing or occluded
+
+    a = np.array(a[:3])  # Use only x, y, z (:3) (ignore visibility)
+    b = np.array(b[:3])  # For only x, y use (:2)
+    c = np.array(c[:3])
+
+    # Vectors BA and BC
+    ba = a - b
+    bc = c - b
+
+    # Dot product and magnitudes
+    dot_product = np.dot(ba, bc)
+    magnitude_ba = np.linalg.norm(ba)
+    magnitude_bc = np.linalg.norm(bc)
+
+    # Prevent division by zero
+    if magnitude_ba == 0 or magnitude_bc == 0:
+        return None
+
+    # Calculate the angle in radians and convert to degrees
+    radians = np.arccos(dot_product / (magnitude_ba * magnitude_bc))
+    angle = np.degrees(radians)
+
+    return angle
+
 @app.post("/process_video/")
 async def process_video(file: UploadFile = File(...)):
     input_path = UPLOAD_FOLDER / file.filename
-    output_path = PROCESSED_FOLDER / f"processed_{file.filename}"
+
+    # Generate a timestamp for the processed file
+    timestamp = datetime.now().strftime("%m%d%Y_%H%M%S")
+    output_filename = f"processed_{timestamp}_{file.filename}"
+    output_path = PROCESSED_FOLDER / output_filename
 
     with open(input_path, "wb") as f:
         f.write(file.file.read())
@@ -58,49 +103,85 @@ async def process_video(file: UploadFile = File(...)):
 
             if results.pose_landmarks:
                 landmarks = results.pose_landmarks.landmark
+                height, width, _ = frame.shape
 
                 # Smooth landmarks
                 smoothed_landmarks = [
                     smooth_landmarks(
-                        [lm.x, lm.y, lm.z, lm.visibility],
+                        [lm.x * width, lm.y * height, lm.z * width, lm.visibility],
                         smoothing_history,
-                        i
+                        i,
                     ) for i, lm in enumerate(landmarks)
                 ]
 
-                # Calculate pelvis as origin
-                left_hip = np.array(smoothed_landmarks[23][:3])  # Left hip index
-                right_hip = np.array(smoothed_landmarks[24][:3])  # Right hip index
+                # Define joint groups for angles
+                left_elbow_angle = calculate_angle(
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value],
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value],
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value],
+                )
+                left_knee_angle = calculate_angle(
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value],
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value],
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value],
+                )
+                left_hip_angle = calculate_angle(
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value],
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value],
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value],
+                )
+
+                # Display angles on video
+                if left_elbow_angle is not None:
+                    cv2.putText(
+                        frame,
+                        f"Elbow: {int(left_elbow_angle)}\u00B0",
+                        tuple(np.array(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value][:2], dtype=int)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 255),
+                        2,
+                    )
+                if left_knee_angle is not None:
+                    cv2.putText(
+                        frame,
+                        f"Knee: {int(left_knee_angle)}\u00B0",
+                        tuple(np.array(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value][:2], dtype=int)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 255),
+                        2,
+                    )
+                if left_hip_angle is not None:
+                    cv2.putText(
+                        frame,
+                        f"Hip: {int(left_hip_angle)}\u00B0",
+                        tuple(np.array(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value][:2], dtype=int)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                # Calculate pelvis origin
+                left_hip = np.array(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value][:2])
+                right_hip = np.array(smoothed_landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value][:2])
                 pelvis_origin = (left_hip + right_hip) / 2
 
-                # Adjust landmarks relative to the pelvis origin
-                adjusted_landmarks = [
-                    [
-                        lm[0] - pelvis_origin[0],
-                        lm[1] - pelvis_origin[1],
-                        lm[2] - pelvis_origin[2],
-                        lm[3]
-                    ]
-                    if lm[3] > 0.5 else None  # Handle occlusion by skipping low-visibility landmarks
-                    for lm in smoothed_landmarks
-                ]
-
-                # Visualize motion trails and landmarks
-                for i, lm in enumerate(adjusted_landmarks):
-                    if lm is not None:
-                        x, y = int(lm[0] * frame.shape[1]), int(lm[1] * frame.shape[0])
-                        motion_trails[i].append((x, y))
-                        for j in range(1, len(motion_trails[i])):
-                            cv2.line(frame, motion_trails[i][j - 1], motion_trails[i][j], (0, 255, 0), 2)
-
                 # Draw 3D axes at the pelvis origin
-                origin_x, origin_y = int(pelvis_origin[0] * frame.shape[1]), int(pelvis_origin[1] * frame.shape[0])
+                origin_x, origin_y = int(pelvis_origin[0]), int(pelvis_origin[1])
                 cv2.line(frame, (origin_x, origin_y), (origin_x + 50, origin_y), (0, 0, 255), 3)  # X-axis (Red)
                 cv2.line(frame, (origin_x, origin_y), (origin_x, origin_y - 50), (0, 255, 0), 3)  # Y-axis (Green)
                 cv2.line(frame, (origin_x, origin_y), (origin_x, origin_y + 50), (255, 0, 0), 3)  # Z-axis (Blue)
 
-                # Draw landmarks
-                mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                # Draw landmarks and connections excluding facial landmarks
+                mp_drawing.draw_landmarks(
+                    frame,
+                    results.pose_landmarks,  # Use the full landmark set
+                    CUSTOM_POSE_CONNECTIONS,  # Use filtered connections
+                    mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=4),
+                    mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2, circle_radius=2),
+                )
 
             # Write output video
             if out is None:
@@ -112,4 +193,4 @@ async def process_video(file: UploadFile = File(...)):
     if out:
         out.release()
 
-    return FileResponse(output_path, media_type="video/mp4", filename=output_path.name)
+    return FileResponse(output_path, media_type="video/mp4", filename=output_filename)
