@@ -3,6 +3,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from pathlib import Path
+from collections import deque
 from fastapi.responses import FileResponse
 
 app = FastAPI()
@@ -20,145 +21,95 @@ PROCESSED_FOLDER.mkdir(exist_ok=True)
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
-def calculate_angle(a, b, c):
-    """Calculate angle between three points."""
-    a = np.array(a)
-    b = np.array(b)
-    c = np.array(c)
+# Constants for smoothing and motion trails
+SMOOTHING_WINDOW = 5
+MOTION_TRAIL_LENGTH = 10
 
-    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
-    angle = np.abs(radians * 180.0 / np.pi)
-    if angle > 180.0:
-        angle = 360 - angle
-    return angle
+# Initialize smoothing history and motion trails
+smoothing_history = {i: deque(maxlen=SMOOTHING_WINDOW) for i in range(33)}  # 33 landmarks
+motion_trails = {i: deque(maxlen=MOTION_TRAIL_LENGTH) for i in range(33)}
 
-def process_video(input_path: Path, output_path: Path):
-    """Process the video, overlay landmarks, angles, skeleton, dashed lines, and shaded areas."""
+def smooth_landmarks(landmarks, history, index):
+    """Apply moving average smoothing for landmarks."""
+    history[index].append(landmarks)
+    if len(history[index]) < SMOOTHING_WINDOW:
+        return landmarks  # Not enough data for smoothing
+    return np.mean(history[index], axis=0)
+
+@app.post("/process_video/")
+async def process_video(file: UploadFile = File(...)):
+    input_path = UPLOAD_FOLDER / file.filename
+    output_path = PROCESSED_FOLDER / f"processed_{file.filename}"
+
+    with open(input_path, "wb") as f:
+        f.write(file.file.read())
+
     cap = cv2.VideoCapture(str(input_path))
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(str(output_path), fourcc, int(cap.get(cv2.CAP_PROP_FPS)), 
-                          (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))))
+    out = None
 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image.flags.writeable = False
-            results = pose.process(image)
-            image.flags.writeable = True
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-            height, width, _ = image.shape
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(rgb_frame)
 
             if results.pose_landmarks:
-                # Draw Mediapipe skeleton
-                mp_drawing.draw_landmarks(
-                    image,
-                    results.pose_landmarks,
-                    mp_pose.POSE_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=4),  # Joint points
-                    mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2, circle_radius=2),  # Connections
-                )
-
                 landmarks = results.pose_landmarks.landmark
 
-                # Key points
-                left_shoulder = np.array([
-                    landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x * width,
-                    landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y * height
-                ])
-                right_shoulder = np.array([
-                    landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x * width,
-                    landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y * height
-                ])
-                left_hip = np.array([
-                    landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x * width,
-                    landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y * height
-                ])
-                right_hip = np.array([
-                    landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x * width,
-                    landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y * height
-                ])
-                left_elbow = np.array([
-                    landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x * width,
-                    landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y * height
-                ])
-                left_wrist = np.array([
-                    landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x * width,
-                    landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y * height
-                ])
-                left_knee = np.array([
-                    landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x * width,
-                    landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y * height
-                ])
-                left_ankle = np.array([
-                    landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].x * width,
-                    landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y * height
-                ])
+                # Smooth landmarks
+                smoothed_landmarks = [
+                    smooth_landmarks(
+                        [lm.x, lm.y, lm.z, lm.visibility],
+                        smoothing_history,
+                        i
+                    ) for i, lm in enumerate(landmarks)
+                ]
 
-                # Midpoints for spine alignment
-                mid_shoulders = (left_shoulder + right_shoulder) / 2
-                mid_hips = (left_hip + right_hip) / 2
+                # Calculate pelvis as origin
+                left_hip = np.array(smoothed_landmarks[23][:3])  # Left hip index
+                right_hip = np.array(smoothed_landmarks[24][:3])  # Right hip index
+                pelvis_origin = (left_hip + right_hip) / 2
 
-                # Solid lines for pose structure
-                cv2.line(image, tuple(left_shoulder.astype(int)), tuple(right_shoulder.astype(int)), (255, 0, 0), 2)  # Shoulders
-                cv2.line(image, tuple(left_hip.astype(int)), tuple(right_hip.astype(int)), (0, 0, 255), 2)  # Hips
-                cv2.line(image, tuple(mid_shoulders.astype(int)), tuple(mid_hips.astype(int)), (0, 255, 0), 2)  # Spine
+                # Adjust landmarks relative to the pelvis origin
+                adjusted_landmarks = [
+                    [
+                        lm[0] - pelvis_origin[0],
+                        lm[1] - pelvis_origin[1],
+                        lm[2] - pelvis_origin[2],
+                        lm[3]
+                    ]
+                    if lm[3] > 0.5 else None  # Handle occlusion by skipping low-visibility landmarks
+                    for lm in smoothed_landmarks
+                ]
 
-                # Dashed vertical reference line
-                for i in range(0, height, 20):
-                    cv2.line(image, (int(width / 2), i), (int(width / 2), i + 10), (0, 255, 255), 2)
+                # Visualize motion trails and landmarks
+                for i, lm in enumerate(adjusted_landmarks):
+                    if lm is not None:
+                        x, y = int(lm[0] * frame.shape[1]), int(lm[1] * frame.shape[0])
+                        motion_trails[i].append((x, y))
+                        for j in range(1, len(motion_trails[i])):
+                            cv2.line(frame, motion_trails[i][j - 1], motion_trails[i][j], (0, 255, 0), 2)
 
-                # Dashed lines extending the spine
-                for i in range(0, int(np.linalg.norm(mid_shoulders - mid_hips)), 20):
-                    start = mid_shoulders + i * (mid_hips - mid_shoulders) / np.linalg.norm(mid_shoulders - mid_hips)
-                    end = mid_shoulders + (i + 10) * (mid_hips - mid_shoulders) / np.linalg.norm(mid_shoulders - mid_hips)
-                    cv2.line(image, tuple(start.astype(int)), tuple(end.astype(int)), (0, 255, 255), 2)
+                # Draw 3D axes at the pelvis origin
+                origin_x, origin_y = int(pelvis_origin[0] * frame.shape[1]), int(pelvis_origin[1] * frame.shape[0])
+                cv2.line(frame, (origin_x, origin_y), (origin_x + 50, origin_y), (0, 0, 255), 3)  # X-axis (Red)
+                cv2.line(frame, (origin_x, origin_y), (origin_x, origin_y - 50), (0, 255, 0), 3)  # Y-axis (Green)
+                cv2.line(frame, (origin_x, origin_y), (origin_x, origin_y + 50), (255, 0, 0), 3)  # Z-axis (Blue)
 
-                # # Green shaded triangle for deviation visualization
-                # deviation_vector = mid_shoulders - mid_hips
-                # deviation_end = mid_shoulders + np.array([0, np.linalg.norm(deviation_vector)])
-                # points = np.array([mid_hips, mid_shoulders, deviation_end], dtype=np.int32)
-                # cv2.fillPoly(image, [points], color=(0, 255, 0, 50))
+                # Draw landmarks
+                mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-                # Joint angle calculations
-                elbow_angle = calculate_angle(left_shoulder, left_elbow, left_wrist)
-                knee_angle = calculate_angle(left_hip, left_knee, left_ankle)
-                hip_angle = calculate_angle(left_shoulder, left_hip, left_knee)
-                spine_angle = calculate_angle(left_shoulder, left_hip, left_knee)
-
-                # Display joint angles
-                cv2.putText(image, f'Elbow: {int(elbow_angle)}°', tuple(left_elbow.astype(int)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                cv2.putText(image, f'Knee: {int(knee_angle)}°', tuple(left_knee.astype(int)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                cv2.putText(image, f'Hip: {int(hip_angle)}°', tuple(left_hip.astype(int)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                cv2.putText(image, f'Spine: {int(spine_angle)}°', (int(left_hip[0]) + 50, int(left_hip[1]) - 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-            # Write the processed frame
-            out.write(image)
+            # Write output video
+            if out is None:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(str(output_path), fourcc, cap.get(cv2.CAP_PROP_FPS), (frame.shape[1], frame.shape[0]))
+            out.write(frame)
 
     cap.release()
-    out.release()
+    if out:
+        out.release()
 
-@app.post("/process-video/")
-async def upload_video(file: UploadFile = File(...)):
-    """Handle video upload and return the processed video."""
-    input_path = UPLOAD_FOLDER / file.filename
-    output_path = PROCESSED_FOLDER / f"processed_{file.filename}"
-
-    # Save the uploaded file
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
-
-    # Process the video
-    process_video(input_path, output_path)
-
-    # Return the processed video file
-    return FileResponse(output_path, media_type="video/mp4", filename=f"processed_{file.filename}")
-
+    return FileResponse(output_path, media_type="video/mp4", filename=output_path.name)
