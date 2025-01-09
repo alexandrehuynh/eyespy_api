@@ -161,7 +161,7 @@ async def process_video(file: UploadFile = File(...)):
                 if left_elbow_angle is not None:
                     cv2.putText(
                         frame,
-                        f"Elbow: {int(left_elbow_angle)}°",
+                        f"Elbow: {int(left_elbow_angle)}",
                         (int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value][0] + 20),
                          int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value][1] - 20)),
                         cv2.FONT_HERSHEY_SIMPLEX,
@@ -172,7 +172,7 @@ async def process_video(file: UploadFile = File(...)):
                 if left_knee_angle is not None:
                     cv2.putText(
                         frame,
-                        f"Knee: {int(left_knee_angle)}°",
+                        f"Knee: {int(left_knee_angle)}",
                         (int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value][0] + 20),
                          int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value][1] - 20)),
                         cv2.FONT_HERSHEY_SIMPLEX,
@@ -183,7 +183,7 @@ async def process_video(file: UploadFile = File(...)):
                 if left_hip_angle is not None:
                     cv2.putText(
                         frame,
-                        f"Hip: {int(left_hip_angle)}°",
+                        f"Hip: {int(left_hip_angle)}",
                         (int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value][0] + 20),
                          int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value][1] - 20)),
                         cv2.FONT_HERSHEY_SIMPLEX,
