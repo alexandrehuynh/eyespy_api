@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 from datetime import datetime
 from mediapipe.python.solutions.pose import POSE_CONNECTIONS
 from mediapipe.framework.formats.landmark_pb2 import NormalizedLandmarkList
+import json  # Import JSON for metadata saving
 
 app = FastAPI()
 
@@ -15,6 +16,7 @@ app = FastAPI()
 BASE_DIR = Path(__file__).resolve().parent.parent  # Navigate one level up
 UPLOAD_FOLDER = BASE_DIR / "uploads"
 PROCESSED_FOLDER = BASE_DIR / "processed"
+META_FOLDER = PROCESSED_FOLDER / "meta"
 
 # Ensure folders exist
 UPLOAD_FOLDER.mkdir(exist_ok=True)
@@ -84,6 +86,7 @@ async def process_video(file: UploadFile = File(...)):
     # Generate a timestamp for the processed file
     timestamp = datetime.now().strftime("%m%d%Y_%H%M%S")
     output_filename = f"processed_{timestamp}_{file.filename}"
+    output_metadata_path = META_FOLDER / f"{timestamp}_metadata.json"
     output_path = PROCESSED_FOLDER / output_filename
 
     with open(input_path, "wb") as f:
@@ -91,6 +94,7 @@ async def process_video(file: UploadFile = File(...)):
 
     cap = cv2.VideoCapture(str(input_path))
     out = None
+    metadata = {"frames": []}  # Metadata for storing angles and timestamps
 
     with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as pose:
         while cap.isOpened():
@@ -131,35 +135,48 @@ async def process_video(file: UploadFile = File(...)):
                     smoothed_landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value],
                 )
 
-                # Display angles on video
+                # Save angles to metadata
+                metadata["frames"].append({
+                    "timestamp": cap.get(cv2.CAP_PROP_POS_MSEC),
+                    "angles": {
+                        "elbow": left_elbow_angle,
+                        "knee": left_knee_angle,
+                        "hip": left_hip_angle,
+                    },
+                })
+
+                # Display angles on video with dynamic positioning
                 if left_elbow_angle is not None:
                     cv2.putText(
                         frame,
-                        f"Elbow: {int(left_elbow_angle)}",
-                        tuple(np.array(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value][:2], dtype=int)),
+                        f"Elbow: {int(left_elbow_angle)}°",
+                        (int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value][0] + 20),
+                         int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value][1] - 20)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
-                        (255, 255, 255),
+                        (0, 255, 0) if left_elbow_angle < 90 else (0, 0, 255),
                         2,
                     )
                 if left_knee_angle is not None:
                     cv2.putText(
                         frame,
-                        f"Knee: {int(left_knee_angle)}",
-                        tuple(np.array(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value][:2], dtype=int)),
+                        f"Knee: {int(left_knee_angle)}°",
+                        (int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value][0] + 20),
+                         int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value][1] - 20)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
-                        (255, 255, 255),
+                        (0, 255, 0) if left_knee_angle < 90 else (0, 0, 255),
                         2,
                     )
                 if left_hip_angle is not None:
                     cv2.putText(
                         frame,
-                        f"Hip: {int(left_hip_angle)}",
-                        tuple(np.array(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value][:2], dtype=int)),
+                        f"Hip: {int(left_hip_angle)}°",
+                        (int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value][0] + 20),
+                         int(smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value][1] - 20)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
-                        (255, 255, 255),
+                        (0, 255, 0) if left_hip_angle < 90 else (0, 0, 255),
                         2,
                     )
 
@@ -173,16 +190,16 @@ async def process_video(file: UploadFile = File(...)):
                 overlay = frame.copy()
 
                 # Extended axes
-                x_length, y_length, z_length = 500, 500, 500  # Extend line lengths
-                cv2.line(overlay, (origin_x, origin_y), (origin_x + x_length, origin_y), (0, 0, 255), 3)  # X-axis (Red)
-                cv2.line(overlay, (origin_x, origin_y), (origin_x, origin_y - y_length), (0, 255, 0), 3)  # Y-axis (Green)
-                cv2.line(overlay, (origin_x, origin_y), (origin_x, origin_y + z_length), (255, 0, 0), 3)  # Z-axis (Blue)
+                x_length, y_length, z_length = int(width * 0.2), int(height * 0.2), int(height * 0.2)
+                cv2.line(overlay, (origin_x, origin_y), (origin_x + x_length, origin_y), (0, 0, 255), 3)
+                cv2.line(overlay, (origin_x, origin_y), (origin_x, origin_y - y_length), (0, 255, 0), 3)
+                cv2.line(overlay, (origin_x, origin_y), (origin_x, origin_y + z_length), (255, 0, 0), 3)
 
                 # Apply opacity to axes
-                alpha = 0.5  # Opacity level
+                alpha = 0.5
                 frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
 
-                # Create a filtered landmark list without facial landmarks
+            # Create a filtered landmark list without facial landmarks
                 filtered_landmarks = NormalizedLandmarkList()
                 filtered_landmarks.landmark.extend(
                     [lm for i, lm in enumerate(results.pose_landmarks.landmark) if i >= 11]
@@ -206,11 +223,21 @@ async def process_video(file: UploadFile = File(...)):
             # Write output video
             if out is None:
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = cv2.VideoWriter(str(output_path), fourcc, cap.get(cv2.CAP_PROP_FPS), (frame.shape[1], frame.shape[0]))
+                out = cv2.VideoWriter(str(output_path), fourcc, cap.get(cv2.CAP_PROP_FPS),
+                                      (frame.shape[1], frame.shape[0]))
             out.write(frame)
 
     cap.release()
     if out:
         out.release()
+
+
+    # Ensure the metadata directory exists
+    metadata_dir = output_metadata_path.parent
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save metadata to a JSON file
+    with open(output_metadata_path, "w") as meta_file:
+        json.dump(metadata, meta_file)
 
     return FileResponse(output_path, media_type="video/mp4", filename=output_filename)
