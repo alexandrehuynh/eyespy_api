@@ -79,6 +79,18 @@ def calculate_angle(a, b, c):
 
     return angle
 
+def get_spine_midpoints(shoulder_midpoint, hip_midpoint, num_points=5):
+    """
+    Generate evenly spaced points along the line connecting the shoulder and hip midpoints.
+    """
+    spine_midpoints = []
+    for i in range(num_points + 1):  # Include both endpoints
+        t = i / num_points
+        mid_x = (1 - t) * shoulder_midpoint[0] + t * hip_midpoint[0]
+        mid_y = (1 - t) * shoulder_midpoint[1] + t * hip_midpoint[1]
+        spine_midpoints.append((mid_x, mid_y))
+    return spine_midpoints
+
 @app.post("/process_video/")
 async def process_video(file: UploadFile = File(...)):
     input_path = UPLOAD_FOLDER / file.filename
@@ -199,7 +211,38 @@ async def process_video(file: UploadFile = File(...)):
                 alpha = 0.5
                 frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
 
-            # Create a filtered landmark list without facial landmarks
+                # Calculate shoulder and hip midpoints
+                left_shoulder = np.array([
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value][0],
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value][1],
+                ])
+                right_shoulder = np.array([
+                    smoothed_landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value][0],
+                    smoothed_landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value][1],
+                ])
+                left_hip = np.array([
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value][0],
+                    smoothed_landmarks[mp_pose.PoseLandmark.LEFT_HIP.value][1],
+                ])
+                right_hip = np.array([
+                    smoothed_landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value][0],
+                    smoothed_landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value][1],
+                ])
+
+                # Midpoints for shoulders and hips
+                shoulder_midpoint = (left_shoulder + right_shoulder) / 2
+                hip_midpoint = (left_hip + right_hip) / 2
+
+                # Get spine midpoints
+                spine_midpoints = get_spine_midpoints(shoulder_midpoint, hip_midpoint, num_points=5)
+
+                # Draw spine
+                for i in range(len(spine_midpoints) - 1):
+                    start_point = tuple(map(int, spine_midpoints[i]))
+                    end_point = tuple(map(int, spine_midpoints[i + 1]))
+                    cv2.line(frame, start_point, end_point, (0, 255, 0), 2)  # Green line for spine
+
+                # Create a filtered landmark list without facial landmarks
                 filtered_landmarks = NormalizedLandmarkList()
                 filtered_landmarks.landmark.extend(
                     [lm for i, lm in enumerate(results.pose_landmarks.landmark) if i >= 11]
