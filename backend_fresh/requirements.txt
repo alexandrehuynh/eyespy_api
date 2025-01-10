@@ -41,6 +41,8 @@ cycler==0.12.1
     #   matplotlib
 fastapi==0.115.6
     # via -r requirements.in
+filterpy==1.4.5
+    # via -r requirements.in
 flatbuffers==24.12.23
     # via
     #   -r requirements.in
@@ -96,6 +98,7 @@ markupsafe==3.0.2
 matplotlib==3.10.0
     # via
     #   -r requirements.in
+    #   filterpy
     #   mediapipe
 mdurl==0.1.2
     # via markdown-it-py
@@ -114,6 +117,7 @@ numpy==1.26.4
     # via
     #   -r requirements.in
     #   contourpy
+    #   filterpy
     #   h5py
     #   jax
     #   jaxlib
@@ -197,6 +201,7 @@ scikit-learn==1.6.0
 scipy==1.14.1
     # via
     #   -r requirements.in
+    #   filterpy
     #   jax
     #   jaxlib
     #   scikit-learn

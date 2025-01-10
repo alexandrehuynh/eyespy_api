@@ -3,12 +3,13 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from pathlib import Path
-from collections import deque
+from collections import deque, defaultdict
 from fastapi.responses import FileResponse
 from datetime import datetime
 from mediapipe.python.solutions.pose import POSE_CONNECTIONS
-from mediapipe.framework.formats.landmark_pb2 import NormalizedLandmarkList
+from mediapipe.framework.formats.landmark_pb2 import NormalizedLandmark, NormalizedLandmarkList
 import json  # Import JSON for metadata saving
+from filterpy.kalman import KalmanFilter # Add Kalman filtering for smoother tracking
 
 app = FastAPI()
 
@@ -28,8 +29,8 @@ mp_drawing = mp.solutions.drawing_utils
 
 # Define custom pose connections (excluding face)
 CUSTOM_POSE_CONNECTIONS = set([
-    connection for connection in POSE_CONNECTIONS
-    if connection[0] >= 11 and connection[1] >= 11  # Keep only body-related connections (landmarks 11+)
+    (start, end) for start, end in POSE_CONNECTIONS
+    if 11 <= start < 33 and 11 <= end < 33  # Ensure indices are within valid range
 ])
 
 # Constants for smoothing and motion trails
@@ -42,9 +43,13 @@ motion_trails = {i: deque(maxlen=MOTION_TRAIL_LENGTH) for i in range(33)}
 
 def smooth_landmarks(landmarks, history, index):
     """Apply moving average smoothing for landmarks."""
-    history[index].append(landmarks)
+    if not all(isinstance(coord, (int, float)) for coord in landmarks[:3]):
+        print(f"Skipping invalid landmark: {landmarks}")
+        return landmarks  # Skip invalid landmarks
+
+    history[index].append(landmarks[:3])  # Store only x, y, z for smoothing
     if len(history[index]) < SMOOTHING_WINDOW:
-        return landmarks  # Not enough data for smoothing
+        return landmarks[:3]  # Return as is if not enough data
     return np.mean(history[index], axis=0)
 
 def calculate_angle(a, b, c):
@@ -56,9 +61,9 @@ def calculate_angle(a, b, c):
     if a is None or b is None or c is None:
         return None  # Skip if any point is missing or occluded
 
-    a = np.array(a[:3])  # Use only x, y, z (:3) (ignore visibility)
-    b = np.array(b[:3])  # For only x, y use (:2)
-    c = np.array(c[:3])
+    a = np.array(a[:3]).flatten()  # Use only x, y, z and ensure 1D array
+    b = np.array(b[:3]).flatten()  # Ensure 1D array
+    c = np.array(c[:3]).flatten()  # Ensure 1D array
 
     # Vectors BA and BC
     ba = a - b
@@ -90,7 +95,132 @@ def get_spine_midpoints(shoulder_midpoint, hip_midpoint, num_points=5):
         mid_y = (1 - t) * shoulder_midpoint[1] + t * hip_midpoint[1]
         spine_midpoints.append((mid_x, mid_y))
     return spine_midpoints
+    
+def draw_arrow(frame, start_point, end_point, color=(0, 255, 255), thickness=2):
+    """
+    Draw an arrow between two points on the frame.
+    
+    Parameters:
+    - frame: The image on which to draw.
+    - start_point: The starting point of the arrow (x, y).
+    - end_point: The ending point of the arrow (x, y).
+    - color: The color of the arrow (default is yellow).
+    - thickness: The thickness of the arrow line (default is 2).
+    """
+    cv2.arrowedLine(frame, start_point, end_point, color, thickness, tipLength=0.3)
 
+def init_kalman_filters():
+    """Initialize Kalman filters for each landmark"""
+    filters = {}
+    for i in range(33):
+        kf = KalmanFilter(dim_x=6, dim_z=3)  # State: position, velocity, acceleration
+        kf.F = np.array([[1, 1, 0.5, 0, 0, 0],    # State transition matrix
+                        [0, 1, 1, 0, 0, 0],
+                        [0, 0, 1, 0, 0, 0],
+                        [0, 0, 0, 1, 1, 0.5],
+                        [0, 0, 0, 0, 1, 1],
+                        [0, 0, 0, 0, 0, 1]])
+        filters[i] = kf
+    return filters
+
+def apply_kalman_filtering(landmark, kf):
+    """Apply Kalman filtering to landmark coordinates."""
+    if not isinstance(landmark, NormalizedLandmark):
+        print(f"Invalid landmark detected: {landmark}")
+        return None  # Skip invalid landmark
+
+    measurement = np.array([landmark.x, landmark.y, landmark.z])
+    kf.predict()
+    kf.update(measurement)
+    return kf.x[:3]  # Return filtered position
+
+def draw_motion_heat_map(frame, motion_history):
+    """Create a heat map showing movement intensity"""
+    heat_map = np.zeros_like(frame)
+    for positions in motion_history.values():
+        for pos in positions:
+            cv2.circle(heat_map, (int(pos[0]), int(pos[1])),
+                      10, (0, 0, 255), -1)
+
+    # Apply Gaussian blur to smooth the heat map
+    heat_map = cv2.GaussianBlur(heat_map, (15, 15), 0)
+    return cv2.addWeighted(frame, 0.7, heat_map, 0.3, 0)
+
+def draw_velocity_vectors(frame, current_landmarks, previous_landmarks):
+    """Draw velocity vectors for key joints"""
+    if previous_landmarks:
+        for i in range(len(current_landmarks)):
+            if i in [11, 12, 13, 14, 23, 24, 25, 26]:  # Key joints
+                curr = current_landmarks[i]
+                prev = previous_landmarks[i]
+                cv2.arrowedLine(frame,
+                              (int(prev[0]), int(prev[1])),
+                              (int(curr[0]), int(curr[1])),
+                              (255, 0, 0), 2)
+
+def create_3d_skeleton(landmarks):
+    """Create a 3D skeleton visualization"""
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot joints
+    xs = [lm[0] for lm in landmarks]
+    ys = [lm[1] for lm in landmarks]
+    zs = [lm[2] for lm in landmarks]
+    ax.scatter(xs, ys, zs)
+
+    # Draw connections
+    for connection in CUSTOM_POSE_CONNECTIONS:
+        start = landmarks[connection[0]]
+        end = landmarks[connection[1]]
+        ax.plot([start[0], end[0]],
+                [start[1], end[1]],
+                [start[2], end[2]])
+
+    return fig
+
+def draw_analytics_overlay(frame, angles, velocities):
+    """Draw an analytics overlay with joint angles and velocities."""
+    # Create semi-transparent overlay
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (10, 10), (300, 200), (0, 0, 0), -1)
+    alpha = 0.7
+    frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+    # Add text for analytics
+    y_offset = 40
+    for joint, angle in angles.items():
+        if angle is None:
+            angle_text = "N/A"  # Default text for NoneType
+        else:
+            angle_text = f"{angle:.1f}°"
+        
+        cv2.putText(frame, f"{joint}: {angle_text}",
+                    (20, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (255, 255, 255), 2)
+        y_offset += 30
+        
+def draw_movement_paths(frame, motion_trails):
+    """Draw paths of movement for key joints"""
+    for joint_id, trail in motion_trails.items():
+        points = np.array(list(trail))
+        if len(points) >= 2:
+            # Create smooth curve through points
+            pts = points.reshape((-1, 1, 2)).astype(np.int32)
+            cv2.polylines(frame, [pts], False, (0, 255, 255), 2)
+
+            # Add direction indicators
+            for i in range(len(points) - 1):
+                if i % 2 == 0:  # Add arrows every other segment
+                    pt1 = tuple(points[i].astype(int))
+                    pt2 = tuple(points[i + 1].astype(int))
+                    draw_arrow(frame, pt1, pt2, color=(0, 255, 255), thickness=2)
+
+    
 @app.post("/process_video/")
 async def process_video(file: UploadFile = File(...)):
     input_path = UPLOAD_FOLDER / file.filename
