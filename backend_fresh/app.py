@@ -27,6 +27,7 @@ CONFIG = {
     'AXIS_SCALE': 0.2,
     'AXIS_OPACITY': 0.5,
     'SKELETON_SAVE_INTERVAL': 30,
+    'SMOOTHING_WINDOW': 5,
 }
 
 # Directory Setup
@@ -482,7 +483,7 @@ class VisualEffects:
 
 def setup_paths(file: UploadFile):
     """Setup input, output and metadata paths for video processing"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%m%d%Y_%H%M%S")
     input_path = UPLOAD_FOLDER / file.filename
     output_filename = f"processed_{timestamp}_{file.filename}"
     output_path = PROCESSED_FOLDER / output_filename
