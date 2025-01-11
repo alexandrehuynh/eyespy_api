@@ -80,18 +80,18 @@ class PoseProcessor:
             ])
 
             # Measurement noise covariance (3x3)
-            kf.R = np.eye(3) * 0.01
+            kf.R = np.eye(3) * 0.005  # Reduced measurement noise
 
             # Process noise covariance (6x6)
-            q = 0.1  # process noise
-            kf.Q = np.eye(6) * q
+            q = 0.05  # process noise
+            kf.Q = np.eye(6) * q   # Adjusted process noise
 
             # Initial state covariance (6x6)
-            kf.P = np.eye(6) * 100
+            kf.P = np.eye(6) * 50 # Initial state uncertainty
 
             # Initial state (6x1)
             kf.x = np.zeros((6, 1))
-
+            
             filters[i] = kf
         return filters
 
