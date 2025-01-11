@@ -3,13 +3,15 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from pathlib import Path
-from collections import deque, defaultdict
+from collections import deque
 from fastapi.responses import FileResponse
 from datetime import datetime
 from mediapipe.python.solutions.pose import POSE_CONNECTIONS
 from mediapipe.framework.formats.landmark_pb2 import NormalizedLandmark, NormalizedLandmarkList
 import json  # Import JSON for metadata saving
 from filterpy.kalman import KalmanFilter # Add Kalman filtering for smoother tracking
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 app = FastAPI()
 
@@ -160,9 +162,6 @@ def draw_velocity_vectors(frame, current_landmarks, previous_landmarks):
 
 def create_3d_skeleton(landmarks):
     """Create a 3D skeleton visualization"""
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
-
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
 

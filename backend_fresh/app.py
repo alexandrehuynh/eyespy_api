@@ -7,12 +7,10 @@ from collections import deque, defaultdict
 from fastapi.responses import FileResponse
 from datetime import datetime
 from mediapipe.python.solutions.pose import POSE_CONNECTIONS
-from mediapipe.framework.formats.landmark_pb2 import NormalizedLandmark, NormalizedLandmarkList
+from mediapipe.framework.formats.landmark_pb2 import NormalizedLandmark
 import json
 from filterpy.kalman import KalmanFilter
 import logging
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
