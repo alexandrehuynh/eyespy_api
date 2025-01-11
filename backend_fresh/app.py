@@ -349,6 +349,42 @@ class PoseProcessor:
 
         return processed_landmarks
     
+    def _smooth_landmark(self, landmark, index):
+        """
+        Apply temporal smoothing to landmark coordinates using a moving average.
+        
+        Args:
+            landmark: List containing [x, y, z, visibility] coordinates
+            index: Landmark index
+            
+        Returns:
+            Smoothed landmark coordinates
+        """
+        try:
+            # Add current landmark to history
+            self.smoothing_history[index].append(landmark)
+            
+            # Calculate smoothed coordinates
+            if len(self.smoothing_history[index]) > 0:
+                # Separate x, y, z coordinates and visibility
+                coords = np.array([l[:3] for l in self.smoothing_history[index]])
+                visibility = np.array([l[3] for l in self.smoothing_history[index]])
+                
+                # Calculate weighted average based on visibility
+                weights = visibility / np.sum(visibility)
+                smoothed_coords = np.average(coords, axis=0, weights=weights)
+                
+                # Use most recent visibility
+                smoothed_visibility = landmark[3]
+                
+                return [*smoothed_coords, smoothed_visibility]
+            
+            return landmark
+            
+        except Exception as e:
+            logger.error(f"Error smoothing landmark {index}: {str(e)}")
+            return landmark
+    
 class VisualEffects:
     """Handle all visual effects and drawing operations"""
 
