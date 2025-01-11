@@ -195,17 +195,17 @@ class PoseProcessor:
         )
         angles['right_knee'] = (26, right_knee)
 
-        # Optional: Calculate spine angle (mid-shoulders to mid-hips)
-        mid_shoulders = (np.array(landmarks[11][:3]) + np.array(landmarks[12][:3])) / 2
-        mid_hips = (np.array(landmarks[23][:3]) + np.array(landmarks[24][:3])) / 2
-        spine_top = np.array(landmarks[0][:3])  # Nose as reference point
+        # # Optional: Calculate spine angle (mid-shoulders to mid-hips)
+        # mid_shoulders = (np.array(landmarks[11][:3]) + np.array(landmarks[12][:3])) / 2
+        # mid_hips = (np.array(landmarks[23][:3]) + np.array(landmarks[24][:3])) / 2
+        # spine_top = np.array(landmarks[0][:3])  # Nose as reference point
         
-        spine_angle = calculate_angle(
-            spine_top,
-            mid_shoulders,
-            mid_hips
-        )
-        angles['spine'] = (0, spine_angle)
+        # spine_angle = calculate_angle(
+        #     spine_top,
+        #     mid_shoulders,
+        #     mid_hips
+        # )
+        # angles['spine'] = (0, spine_angle)
 
         return angles
 
@@ -237,25 +237,36 @@ class PoseProcessor:
                     self.motion_history[i].pop(0)
 
     def _apply_visual_effects(self, frame, landmarks, angles, velocities):
-        """Apply visual effects to the frame"""
-        # Create motion trails
-        for i, landmark in enumerate(landmarks):
-            if landmark is not None:
-                self.motion_trails[i].append(tuple(map(int, landmark[:2])))
+        """Apply visual effects to the frame using CUSTOM_POSE_CONNECTIONS."""
+        # Use CUSTOM_POSE_CONNECTIONS to draw motion trails
+        for start_idx, end_idx in CUSTOM_POSE_CONNECTIONS:
+            # Ensure valid landmarks
+            if (start_idx < len(landmarks) and end_idx < len(landmarks) and
+                landmarks[start_idx] is not None and landmarks[end_idx] is not None):
 
-                # Draw motion trails
-                points = list(self.motion_trails[i])
+                # Get the start and end points
+                start_point = tuple(map(int, landmarks[start_idx][:2]))
+                end_point = tuple(map(int, landmarks[end_idx][:2]))
+
+                # Draw motion trails for the connection
+                self.motion_trails[start_idx].append(start_point)
+                self.motion_trails[end_idx].append(end_point)
+
+                # Draw the motion trail for the connection
+                points = list(self.motion_trails[start_idx])
                 if len(points) > 1:
                     for j in range(1, len(points)):
                         alpha = j / len(points)
-                        cv2.line(frame, points[j-1], points[j],
-                                (0, int(255 * alpha), int(255 * (1-alpha))), 2)
+                        cv2.line(frame, points[j - 1], points[j],
+                                (0, int(255 * alpha), int(255 * (1 - alpha))), 2)
 
-        # Add velocity indicators
-        for i, velocity in velocities.items():
-            if velocity > 5:  # Threshold for significant movement
-                pos = tuple(map(int, landmarks[i][:2]))
-                cv2.circle(frame, pos, int(velocity), (0, 255, 255), 1)
+        # Add velocity indicators for landmarks in CUSTOM_POSE_CONNECTIONS
+        for start_idx, end_idx in CUSTOM_POSE_CONNECTIONS:
+            if start_idx in velocities and landmarks[start_idx] is not None:
+                velocity = velocities[start_idx]
+                if velocity > 5:  # Threshold for significant movement
+                    pos = tuple(map(int, landmarks[start_idx][:2]))
+                    cv2.circle(frame, pos, int(velocity), (0, 255, 255), 1)
 
         return frame
 
@@ -296,7 +307,7 @@ class PoseProcessor:
         self.previous_landmarks = smoothed_landmarks.copy()
 
         return frame, {
-            'landmarks': smoothed_landmarks,  # Add this line
+            'landmarks': smoothed_landmarks, 
             'angles': angles,
             'velocities': velocities,
             'timestamp': datetime.now().timestamp()
@@ -344,17 +355,19 @@ class VisualEffects:
     @staticmethod
     def draw_skeleton(frame, landmarks, connections):
         """Draw the skeleton with custom styling"""
-        # Draw connections
+        # Draw connections in white
         for start_idx, end_idx in connections:
             start_point = tuple(map(int, landmarks[start_idx][:2]))
             end_point = tuple(map(int, landmarks[end_idx][:2]))
-            cv2.line(frame, start_point, end_point, (0, 255, 0), 2)
+            cv2.line(frame, start_point, end_point, (255, 255, 255), 2) 
 
         # Draw landmarks
-        for landmark in landmarks:
-            point = tuple(map(int, landmark[:2]))
-            cv2.circle(frame, point, 4, (0, 255, 0), -1)
-            cv2.circle(frame, point, 2, (255, 255, 255), -1)
+        for i, landmark in enumerate(landmarks):
+            # Only draw landmarks for body (indices 11-32)
+            if 11 <= i < 33:
+                point = tuple(map(int, landmark[:2]))
+                cv2.circle(frame, point, 4, (255, 255, 255), -1)  
+                cv2.circle(frame, point, 2, (128, 128, 128), -1)  # Inner circle slightly darker
 
     @staticmethod
     def draw_angles(frame, landmarks, angles):
@@ -364,7 +377,7 @@ class VisualEffects:
                 position = landmarks[landmark_idx]
                 cv2.putText(
                     frame,
-                    f"{joint_name}: {int(angle)}°",
+                    f"{joint_name}: {int(angle)}",
                     (int(position[0] + 20), int(position[1] - 20)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
