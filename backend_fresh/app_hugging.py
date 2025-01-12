@@ -14,6 +14,8 @@ from filterpy.kalman import KalmanFilter
 import logging
 from transformers import AutoModel, AutoConfig
 import torch
+from model_architectures import MotionBERTModel, Pose3DModel, ActionRecognitionModel, MeshModel
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -66,31 +68,70 @@ class PoseProcessor:
 
         # Load MotionBERT and related models
         model_base_dir = os.path.dirname(os.path.abspath(__file__)) + "/models/"
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        # Load MotionBERT and related models
+        model_base_dir = os.path.dirname(os.path.abspath(__file__)) + "/models/"
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # Load MotionBERT (main model for action recognition)
-        motionbert_folder = os.path.join(model_base_dir, "motionbert")
-        self.motionbert_config = AutoConfig.from_pretrained(motionbert_folder)
-        self.motionbert_model = AutoModel.from_pretrained(
-            motionbert_folder,
-            config=self.motionbert_config,
-            ignore_mismatched_sizes=True
-        )
+        try:
+            # Load MotionBERT
+            motionbert_folder = os.path.join(model_base_dir, "motionbert")
+            self.motionbert_config = AutoConfig.from_pretrained(motionbert_folder)
+            self.motionbert_model = MotionBERTModel.from_pretrained(
+                motionbert_folder,
+                config=self.motionbert_config,
+            ).to(self.device)
 
-        # Load 3D Pose model
-        pose_folder = os.path.join(model_base_dir, "pose")
-        self.pose_model = torch.load(os.path.join(pose_folder, "MB_ft_h36m.bin"))
+            # Load 3D Pose model
+            self.pose_model = Pose3DModel()
+            pose_state_dict = torch.load(
+                os.path.join(model_base_dir, "pose/MB_ft_h36m.bin"),
+                map_location=self.device
+            )
+            self.pose_model.load_state_dict(pose_state_dict)
+            self.pose_model.to(self.device)
 
-        # Load Action Recognition models (xsub and xview)
-        action_folder = os.path.join(model_base_dir, "action")
-        self.action_xsub_model = torch.load(os.path.join(action_folder, "sub", "MB_ft_NTU60_xsub.bin"))
-        self.action_xview_model = torch.load(os.path.join(action_folder, "view", "MB_ft_NTU60_xview.bin"))
+            # Load Action Recognition models
+            self.action_xsub_model = ActionRecognitionModel()
+            self.action_xview_model = ActionRecognitionModel()
+            
+            action_xsub_state_dict = torch.load(
+                os.path.join(model_base_dir, "action/sub/MB_ft_NTU60_xsub.bin"),
+                map_location=self.device
+            )
+            action_xview_state_dict = torch.load(
+                os.path.join(model_base_dir, "action/view/MB_ft_NTU60_xview.bin"),
+                map_location=self.device
+            )
+            
+            self.action_xsub_model.load_state_dict(action_xsub_state_dict)
+            self.action_xview_model.load_state_dict(action_xview_state_dict)
+            
+            self.action_xsub_model.to(self.device)
+            self.action_xview_model.to(self.device)
 
-        # Load Mesh Reconstruction model
-        mesh_folder = os.path.join(model_base_dir, "mesh")
-        self.mesh_model = torch.load(os.path.join(mesh_folder, "MB_ft_pw3d.bin"))
+            # Load Mesh model
+            self.mesh_model = MeshModel()
+            mesh_state_dict = torch.load(
+                os.path.join(model_base_dir, "mesh/MB_ft_pw3d.bin"),
+                map_location=self.device
+            )
+            self.mesh_model.load_state_dict(mesh_state_dict)
+            self.mesh_model.to(self.device)
 
-        print("All models loaded successfully!")
+            # Set all models to evaluation mode
+            self.motionbert_model.eval()
+            self.pose_model.eval()
+            self.action_xsub_model.eval()
+            self.action_xview_model.eval()
+            self.mesh_model.eval()
+
+            print("All models loaded successfully!")
+
+        except Exception as e:
+            logger.error(f"Error loading models: {str(e)}")
+            raise
 
     def _init_kalman_filters(self):
         """Initialize Kalman filters for each landmark"""
@@ -313,16 +354,38 @@ class PoseProcessor:
         if not landmarks:
             raise ValueError("Landmarks are required to generate 3D mesh.")
 
-        # Convert landmarks into the required format for mesh processing
-        input_tensor = torch.tensor([landmarks], dtype=torch.float32)
-
-        # Pass through the mesh model
-        mesh_output = self.mesh_model(input_tensor)
-
-        # Convert the result to a NumPy array for further processing or visualization
-        mesh_result = mesh_output.detach().numpy()
-
-        return mesh_result
+        try:
+            # Convert landmarks to the correct format
+            landmark_tensor = torch.tensor(
+                [[lm[:3] for lm in landmarks]], 
+                dtype=torch.float32,
+                device=self.device
+            )
+            
+            # Process through mesh model
+            with torch.no_grad():
+                mesh_output = self.mesh_model(landmark_tensor)
+            
+            # Convert output to numpy for visualization
+            mesh_result = mesh_output.cpu().numpy()
+            
+            # Create visualization frame
+            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+            
+            # Add your mesh visualization code here
+            # This will depend on the output format of your mesh model
+            # Example placeholder visualization:
+            for vertex in mesh_result[0]:  # Assuming mesh_result[0] contains vertices
+                x, y = int(vertex[0] * 640 + 640), int(vertex[1] * 360 + 360)
+                if 0 <= x < 1280 and 0 <= y < 720:
+                    cv2.circle(frame, (x, y), 1, (255, 255, 255), -1)
+            
+            return frame
+            
+        except Exception as e:
+            logger.error(f"Error generating 3D mesh: {str(e)}")
+            # Return a blank frame in case of error
+            return np.zeros((720, 1280, 3), dtype=np.uint8)
 
     def process_with_motionbert(self, landmarks):
         """Process landmarks with MotionBERT for action recognition, 3D pose, and mesh."""
