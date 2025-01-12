@@ -462,85 +462,7 @@ class PoseProcessor:
         except Exception as e:
             logger.error(f"Error smoothing landmark {index}: {str(e)}")
             return landmark
-        
 
-    def _generate_3d_mesh_frame(self, landmarks):
-        """Generate a frame visualizing the 3D mesh representation.
-        This creates a more detailed mesh visualization based on the MotionBERT mesh model output."""
-        if not landmarks:
-            return np.zeros((720, 1280, 3), dtype=np.uint8)
-
-        try:
-            # Convert landmarks to MotionBERT format
-            motionbert_input = self._convert_to_motionbert_format(landmarks)
-            
-            # Get mesh representation from model
-            with torch.no_grad():
-                mesh_output = self.mesh_model(motionbert_input)
-                
-            # Create visualization frame
-            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-            
-            # Convert mesh vertices to screen coordinates
-            mesh_vertices = mesh_output.cpu().numpy()[0, 0]  # Shape: (N, 3) where N is number of vertices
-            
-            # Visualization parameters
-            scale_factor = 200
-            center_x, center_y = 640, 360
-            depth_scale = 50
-            
-            # Project vertices to 2D space
-            projected_vertices = []
-            for vertex in mesh_vertices:
-                # Apply perspective projection
-                z = vertex[2] * depth_scale + 500
-                x = int(center_x + (vertex[0] * scale_factor * 500) / z)
-                y = int(center_y + (vertex[1] * scale_factor * 500) / z)
-                projected_vertices.append((x, y, vertex[2]))
-
-            # Draw mesh surface
-            # Create triangles between joints based on human body structure
-            body_triangles = [
-                # Torso
-                (11, 12, 23), (12, 24, 23),  # Chest to hips
-                # Arms
-                (11, 13, 15), (12, 14, 16),  # Left & right arms
-                # Legs
-                (23, 25, 27), (24, 26, 28),  # Left & right legs
-            ]
-
-            for triangle in body_triangles:
-                if all(i < len(projected_vertices) for i in triangle):
-                    pts = np.array([[projected_vertices[i][0], projected_vertices[i][1]] 
-                                for i in triangle], np.int32)
-                    
-                    # Calculate average depth for shading
-                    avg_depth = sum(projected_vertices[i][2] for i in triangle) / 3
-                    depth_color = int(255 * (avg_depth + 1) / 2)
-                    color = (depth_color, depth_color, depth_color)  # Grayscale for mesh surface
-                    
-                    # Draw filled triangle with transparency
-                    overlay = frame.copy()
-                    cv2.fillPoly(overlay, [pts], color)
-                    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)  # Transparency effect
-                    
-                    # Draw triangle edges
-                    cv2.polylines(frame, [pts], True, (0, 255, 255), 1)
-
-            # Draw joints on top of mesh
-            for vertex in projected_vertices:
-                cv2.circle(frame, (vertex[0], vertex[1]), 3, (0, 255, 255), -1)
-
-            # Add mesh render parameters as text
-            cv2.putText(frame, "3D Mesh Visualization", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            
-            return frame
-            
-        except Exception as e:
-            logger.error(f"Error generating 3D mesh: {str(e)}")
-            return np.zeros((720, 1280, 3), dtype=np.uint8)
-    
     def _generate_3d_wireframe(self, landmarks):
         """Generate a 3D wireframe visualization from landmarks"""
         if not landmarks:
@@ -553,70 +475,167 @@ class PoseProcessor:
             # Get 3D pose estimation
             with torch.no_grad():
                 pose_3d = self.pose_model(motionbert_input)
+                pose_3d = pose_3d.cpu().numpy()[0, 0]  # Shape: (17, 3)
             
-            # Create visualization frame
-            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-            
-            # Convert 3D pose to screen coordinates
-            pose_coords = pose_3d.cpu().numpy()[0, 0]  # Shape: (17, 3)
+            # Create visualization frame with gray background
+            frame = np.ones((720, 1280, 3), dtype=np.uint8) * 32  # Dark gray background
             
             # Visualization parameters
-            scale_factor = 200  # Scale factor for 3D to 2D projection
-            center_x, center_y = 640, 360  # Center of the frame
-            depth_scale = 50  # Scale factor for depth visualization
+            scale_factor = 1000  # Increased scale factor
+            center_x, center_y = 640, 360
+            
+            # Normalize and center the 3D coordinates
+            pose_mean = np.mean(pose_3d, axis=0)
+            pose_centered = pose_3d - pose_mean
             
             # Project 3D coordinates to 2D
             projected_coords = []
-            for joint in pose_coords:
+            for joint in pose_centered:
                 # Simple perspective projection
-                z = joint[2] * depth_scale + 500  # Add offset to avoid division by zero
-                x = int(center_x + (joint[0] * scale_factor * 500) / z)
-                y = int(center_y + (joint[1] * scale_factor * 500) / z)
-                
-                # Store projected coordinates and depth for visualization
+                z = joint[2] * scale_factor + 1000  # Add offset to avoid division by zero
+                x = int(center_x + (joint[0] * scale_factor * 1000) / (z + 1e-4))
+                y = int(center_y + (joint[1] * scale_factor * 1000) / (z + 1e-4))
                 projected_coords.append((x, y, joint[2]))
             
-            # Draw joints with depth-based coloring
-            for coord in projected_coords:
-                # Color based on depth (red->blue gradient)
-                depth_color = int(255 * (coord[2] + 1) / 2)  # Normalize to 0-255
-                color = (255 - depth_color, 0, depth_color)  # RGB color
-                cv2.circle(frame, (coord[0], coord[1]), 4, color, -1)
-            
-            # Draw connections between joints
+            # Draw connections between joints with depth-based coloring
             for connection in CUSTOM_POSE_CONNECTIONS:
-                start_idx = connection[0]
-                end_idx = connection[1]
+                start_idx = connection[0] - 11  # Adjust indices for body-only landmarks
+                end_idx = connection[1] - 11
                 
-                if (start_idx < len(projected_coords) and 
-                    end_idx < len(projected_coords)):
+                if (0 <= start_idx < len(projected_coords) and 
+                    0 <= end_idx < len(projected_coords)):
+                    
                     start = projected_coords[start_idx]
                     end = projected_coords[end_idx]
                     
-                    # Calculate average depth for connection color
-                    avg_depth = (start[2] + end[2]) / 2
-                    depth_color = int(255 * (avg_depth + 1) / 2)
-                    color = (255 - depth_color, 0, depth_color)
-                    
-                    cv2.line(frame, 
-                            (start[0], start[1]), 
-                            (end[0], end[1]), 
-                            color, 2)
+                    # Check if coordinates are within frame bounds
+                    if (0 <= start[0] < 1280 and 0 <= start[1] < 720 and
+                        0 <= end[0] < 1280 and 0 <= end[1] < 720):
+                        
+                        # Calculate color based on average depth
+                        avg_depth = (start[2] + end[2]) / 2
+                        depth_color = int(255 * (avg_depth + 1) / 2)
+                        color = (0, int(255 * (1 - abs(avg_depth))), 255)  # Cyan to blue gradient
+                        
+                        cv2.line(frame, 
+                                (int(start[0]), int(start[1])), 
+                                (int(end[0]), int(end[1])), 
+                                color, 2)
             
-            # Add coordinate axes for reference
+            # Draw joints with depth-based size and color
+            for i, coord in enumerate(projected_coords):
+                if 0 <= coord[0] < 1280 and 0 <= coord[1] < 720:
+                    # Size based on depth (closer joints are larger)
+                    size = int(6 * (1 + coord[2]))
+                    # Color based on depth (closer joints are brighter)
+                    brightness = int(255 * (1 - abs(coord[2])))
+                    color = (0, brightness, 255)  # Cyan color scheme
+                    
+                    cv2.circle(frame, (int(coord[0]), int(coord[1])), size, color, -1)
+            
+            # Add coordinate system
             axis_length = 100
-            origin = (50, 670)  # Bottom-left corner
+            origin = (50, 670)
             cv2.line(frame, origin, (origin[0] + axis_length, origin[1]), (0, 0, 255), 2)  # X-axis
             cv2.line(frame, origin, (origin[0], origin[1] - axis_length), (0, 255, 0), 2)  # Y-axis
-            cv2.putText(frame, "X", (origin[0] + axis_length + 10, origin[1]), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            cv2.putText(frame, "Y", (origin[0], origin[1] - axis_length - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.circle(frame, origin, 5, (255, 255, 255), -1)  # Origin point
+            
+            # Add labels and information
+            cv2.putText(frame, "3D Wireframe View", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             
             return frame
             
         except Exception as e:
             logger.error(f"Error generating 3D wireframe: {str(e)}")
+            return np.zeros((720, 1280, 3), dtype=np.uint8)
+
+    def _generate_3d_mesh_frame(self, landmarks):
+        """Generate a frame visualizing the 3D mesh representation."""
+        if not landmarks:
+            return np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        try:
+            # Convert landmarks to MotionBERT format
+            motionbert_input = self._convert_to_motionbert_format(landmarks)
+            
+            # Get mesh representation from model
+            with torch.no_grad():
+                mesh_output = self.mesh_model(motionbert_input)
+                mesh_vertices = mesh_output.cpu().numpy()[0, 0]  # Shape: (N, 3)
+            
+            # Create visualization frame with dark background
+            frame = np.ones((720, 1280, 3), dtype=np.uint8) * 32
+            
+            # Visualization parameters
+            scale_factor = 1000
+            center_x, center_y = 640, 360
+            
+            # Center and normalize vertices
+            vertices_mean = np.mean(mesh_vertices, axis=0)
+            vertices_centered = mesh_vertices - vertices_mean
+            
+            # Project vertices to 2D space
+            projected_vertices = []
+            for vertex in vertices_centered:
+                # Perspective projection
+                z = vertex[2] * scale_factor + 1000
+                x = int(center_x + (vertex[0] * scale_factor * 1000) / (z + 1e-4))
+                y = int(center_y + (vertex[1] * scale_factor * 1000) / (z + 1e-4))
+                
+                if 0 <= x < 1280 and 0 <= y < 720:  # Check bounds
+                    projected_vertices.append((x, y, vertex[2]))
+
+            # Define body segments for mesh
+            body_segments = [
+                # Torso
+                ([11, 12, 23, 24], (0, 255, 255)),  # Chest
+                ([23, 24, 25, 26], (0, 200, 255)),  # Abdomen
+                # Arms
+                ([11, 13, 15], (0, 150, 255)),  # Left arm
+                ([12, 14, 16], (0, 150, 255)),  # Right arm
+                # Legs
+                ([23, 25, 27], (0, 100, 255)),  # Left leg
+                ([24, 26, 28], (0, 100, 255)),  # Right leg
+            ]
+
+            # Draw mesh segments
+            for segment_indices, base_color in body_segments:
+                if all(i < len(projected_vertices) for i in segment_indices):
+                    points = np.array([projected_vertices[i][:2] for i in segment_indices])
+                    
+                    # Create alpha mask for smooth rendering
+                    mask = np.zeros((720, 1280), dtype=np.uint8)
+                    cv2.fillPoly(mask, [points.astype(np.int32)], 255)
+                    
+                    # Calculate depth-based color
+                    avg_depth = np.mean([projected_vertices[i][2] for i in segment_indices])
+                    color_factor = (1 - abs(avg_depth)) * 0.7 + 0.3
+                    color = tuple(int(c * color_factor) for c in base_color)
+                    
+                    # Draw filled segment with transparency
+                    colored_segment = np.zeros_like(frame)
+                    cv2.fillPoly(colored_segment, [points.astype(np.int32)], color)
+                    
+                    # Blend with frame
+                    alpha = 0.7
+                    mask_3d = np.stack([mask/255.]*3, axis=2)
+                    frame = np.uint8(frame * (1 - alpha * mask_3d) + colored_segment * (alpha * mask_3d))
+            
+            # Draw edges for definition
+            for segment_indices, _ in body_segments:
+                if all(i < len(projected_vertices) for i in segment_indices):
+                    points = np.array([projected_vertices[i][:2] for i in segment_indices])
+                    cv2.polylines(frame, [points.astype(np.int32)], True, (255, 255, 255), 1)
+
+            # Add labels and information
+            cv2.putText(frame, "3D Mesh Visualization", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+            return frame
+            
+        except Exception as e:
+            logger.error(f"Error generating 3D mesh: {str(e)}")
             return np.zeros((720, 1280, 3), dtype=np.uint8)
         
 class VisualEffects:
