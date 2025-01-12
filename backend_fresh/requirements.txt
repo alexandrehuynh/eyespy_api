@@ -263,6 +263,7 @@ pytz==2024.2
     #   pandas
 pyyaml==6.0.2
     # via
+    #   -r requirements.in
     #   huggingface-hub
     #   transformers
 regex==2024.11.6

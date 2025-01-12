@@ -1,6 +1,7 @@
 import os
 from fastapi import FastAPI, File, UploadFile, HTTPException
 import cv2
+import sys
 import mediapipe as mp
 import numpy as np
 from pathlib import Path
@@ -12,10 +13,22 @@ from mediapipe.framework.formats.landmark_pb2 import NormalizedLandmark
 import json
 from filterpy.kalman import KalmanFilter
 import logging
-from transformers import AutoModel, AutoConfig
 import torch
-from model_architectures import MotionBERTModel, Pose3DModel, ActionRecognitionModel, MeshModel
+from motionbert_models import (
+    load_motionbert_model,
+    load_pose_model,
+    load_action_models,
+    load_mesh_model,
+)
 
+# Add MotionBERT/lib to sys.path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+motionbert_path = os.path.join(script_dir, "MotionBERT", "lib")
+sys.path.append(motionbert_path)
+print("Python search path:", sys.path)
+
+from model.DSTformer import DSTformer  # Backbone for MotionBERT
+from model.model_action import ActionNet  # For action recognition
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -42,8 +55,8 @@ CUSTOM_POSE_CONNECTIONS = set([
 # Directory Setup
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_FOLDER = BASE_DIR / "uploads"
-PROCESSED_FOLDER = BASE_DIR / "processed"
-MOTIONBERT_FOLDER = BASE_DIR / PROCESSED_FOLDER / "3d_mesh"
+PROCESSED_FOLDER = BASE_DIR / "processed" / "app_hug"
+MOTIONBERT_FOLDER = BASE_DIR / "processed" / "3d_mesh"
 META_FOLDER = PROCESSED_FOLDER / "meta"
 
 # Ensure folders exist
@@ -58,79 +71,19 @@ mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
 class PoseProcessor:
-    def __init__(self):
+    def __init__(self, model_base_dir, device):
         self.kalman_filters = self._init_kalman_filters()
         self.smoothing_history = defaultdict(lambda: deque(maxlen=CONFIG['SMOOTHING_WINDOW']))
         self.motion_trails = defaultdict(lambda: deque(maxlen=CONFIG['MOTION_TRAIL_LENGTH']))
         self.motion_history = defaultdict(list)
         self.previous_landmarks = None
 
-
-        # Load MotionBERT and related models
-        model_base_dir = os.path.dirname(os.path.abspath(__file__)) + "/models/"
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        # Load MotionBERT and related models
-        model_base_dir = os.path.dirname(os.path.abspath(__file__)) + "/models/"
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+        # Load models using the consolidated function
         try:
-            # Load MotionBERT
-            motionbert_folder = os.path.join(model_base_dir, "motionbert")
-            self.motionbert_config = AutoConfig.from_pretrained(motionbert_folder)
-            self.motionbert_model = MotionBERTModel.from_pretrained(
-                motionbert_folder,
-                config=self.motionbert_config,
-            ).to(self.device)
-
-            # Load 3D Pose model
-            self.pose_model = Pose3DModel()
-            pose_state_dict = torch.load(
-                os.path.join(model_base_dir, "pose/MB_ft_h36m.bin"),
-                map_location=self.device
-            )
-            self.pose_model.load_state_dict(pose_state_dict)
-            self.pose_model.to(self.device)
-
-            # Load Action Recognition models
-            self.action_xsub_model = ActionRecognitionModel()
-            self.action_xview_model = ActionRecognitionModel()
-            
-            action_xsub_state_dict = torch.load(
-                os.path.join(model_base_dir, "action/sub/MB_ft_NTU60_xsub.bin"),
-                map_location=self.device
-            )
-            action_xview_state_dict = torch.load(
-                os.path.join(model_base_dir, "action/view/MB_ft_NTU60_xview.bin"),
-                map_location=self.device
-            )
-            
-            self.action_xsub_model.load_state_dict(action_xsub_state_dict)
-            self.action_xview_model.load_state_dict(action_xview_state_dict)
-            
-            self.action_xsub_model.to(self.device)
-            self.action_xview_model.to(self.device)
-
-            # Load Mesh model
-            self.mesh_model = MeshModel()
-            mesh_state_dict = torch.load(
-                os.path.join(model_base_dir, "mesh/MB_ft_pw3d.bin"),
-                map_location=self.device
-            )
-            self.mesh_model.load_state_dict(mesh_state_dict)
-            self.mesh_model.to(self.device)
-
-            # Set all models to evaluation mode
-            self.motionbert_model.eval()
-            self.pose_model.eval()
-            self.action_xsub_model.eval()
-            self.action_xview_model.eval()
-            self.mesh_model.eval()
-
+            self.motionbert_model, self.action_model = load_motionbert_models(model_base_dir, device)
             print("All models loaded successfully!")
-
         except Exception as e:
-            logger.error(f"Error loading models: {str(e)}")
+            logger.error(f"Failed to load models: {e}")
             raise
 
     def _init_kalman_filters(self):
@@ -388,36 +341,33 @@ class PoseProcessor:
             return np.zeros((720, 1280, 3), dtype=np.uint8)
 
     def process_with_motionbert(self, landmarks):
-        """Process landmarks with MotionBERT for action recognition, 3D pose, and mesh."""
+        """Process landmarks with MotionBERT for action recognition and 3D pose."""
         if not landmarks:
             return None
 
-        # Convert landmarks to MotionBERT input format
-        sequence = []
-        for lm in landmarks:
-            sequence.extend(lm[:3])  # Use x, y, z coordinates
-
-        # Create input tensor and ensure it's the correct data type
-        input_tensor = torch.tensor([sequence], dtype=torch.float32)
-        input_tensor = input_tensor.long()
-
         try:
-            # Action Recognition
-            motionbert_output = self.motionbert_model(input_tensor)
-            action_logits = motionbert_output.last_hidden_state.detach().numpy()
-            recognized_action = int(np.argmax(action_logits))
-
-            # 3D Pose Processing
-            pose_3d = self.pose_model(input_tensor)
-            pose_3d_result = pose_3d.detach().numpy()
-
-            # Mesh Reconstruction using add_3d_mesh
-            mesh_result = self._add_3d_mesh(landmarks)
+            # Convert landmarks to expected format (1, 1, 243, 17, 3)
+            # Note: We'll implement the proper conversion in the next step
+            # This is just a placeholder to show the processing flow
+            sequence = torch.tensor([[[landmarks]]], dtype=torch.float32).to(self.device)
+            
+            # Get motion representation
+            with torch.no_grad():
+                motion_features = self.motionbert_model.get_representation(sequence.squeeze(1))
+                
+                # Get action recognition
+                action_output = self.action_model(sequence)
+                action_probs = torch.softmax(action_output, dim=1)
+                recognized_action = int(torch.argmax(action_probs))
+                
+                # Get 3D pose representation
+                pose_3d = self.motionbert_model(sequence.squeeze(1))
 
             return {
                 "action": recognized_action,
-                "pose_3d": pose_3d_result.tolist(),
-                "mesh": mesh_result.tolist()
+                "action_confidence": float(torch.max(action_probs).cpu()),
+                "pose_3d": pose_3d.cpu().numpy().tolist(),
+                "motion_features": motion_features.cpu().numpy().tolist()
             }
 
         except Exception as e:
@@ -722,7 +672,9 @@ async def process_video(file: UploadFile = File(...)):
         input_path, output_path, motionbert_output_path, metadata_path = setup_paths(file)
 
         # Initialize processors
-        pose_processor = PoseProcessor()
+        model_base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motionbert", "params")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        pose_processor = PoseProcessor(model_base_dir, device)
         visual_effects = VisualEffects()
 
         # Process video
@@ -812,10 +764,16 @@ def process_video_frames(input_path, output_path, motionbert_output_path, pose_p
                     )
 
                     # Update metadata
-                    metadata["frames"].append({
+                    frame_metadata = {
                         "timestamp": cap.get(cv2.CAP_PROP_POS_MSEC),
-                        **frame_data
-                    })
+                        "landmarks": None,
+                        "angles": None,
+                        "velocities": None,
+                        "motionbert_results": None,
+                    }
+                    if frame_data:
+                        frame_metadata.update(frame_data)
+                    metadata["frames"].append(frame_metadata)
 
                     # Generate 3D mesh frame
                     mesh_frame = pose_processor._add_3d_mesh(
