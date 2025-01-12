@@ -503,17 +503,160 @@ class PoseProcessor:
             return landmark
         
 
-    def generate_3d_mesh_frame(landmarks, motionbert_results):
-        """Generate a frame visualizing the 3D mesh and action recognition."""
-        # Create a blank frame for visualization
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)  # Adjust resolution as needed
+    def _generate_3d_mesh_frame(self, landmarks):
+        """Generate a frame visualizing the 3D mesh representation.
+        This creates a more detailed mesh visualization based on the MotionBERT mesh model output."""
+        if not landmarks:
+            return np.zeros((720, 1280, 3), dtype=np.uint8)
 
-        # Draw 3D pose (example visualization)
-        for lm in landmarks:
-            x, y, z = lm[:3]
-            cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 0), -1)  # Example: Draw joints
+        try:
+            # Convert landmarks to MotionBERT format
+            motionbert_input = self._convert_to_motionbert_format(landmarks)
+            
+            # Get mesh representation from model
+            with torch.no_grad():
+                mesh_output = self.mesh_model(motionbert_input)
+                
+            # Create visualization frame
+            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+            
+            # Convert mesh vertices to screen coordinates
+            mesh_vertices = mesh_output.cpu().numpy()[0, 0]  # Shape: (N, 3) where N is number of vertices
+            
+            # Visualization parameters
+            scale_factor = 200
+            center_x, center_y = 640, 360
+            depth_scale = 50
+            
+            # Project vertices to 2D space
+            projected_vertices = []
+            for vertex in mesh_vertices:
+                # Apply perspective projection
+                z = vertex[2] * depth_scale + 500
+                x = int(center_x + (vertex[0] * scale_factor * 500) / z)
+                y = int(center_y + (vertex[1] * scale_factor * 500) / z)
+                projected_vertices.append((x, y, vertex[2]))
 
-        return frame
+            # Draw mesh surface
+            # Create triangles between joints based on human body structure
+            body_triangles = [
+                # Torso
+                (11, 12, 23), (12, 24, 23),  # Chest to hips
+                # Arms
+                (11, 13, 15), (12, 14, 16),  # Left & right arms
+                # Legs
+                (23, 25, 27), (24, 26, 28),  # Left & right legs
+            ]
+
+            for triangle in body_triangles:
+                if all(i < len(projected_vertices) for i in triangle):
+                    pts = np.array([[projected_vertices[i][0], projected_vertices[i][1]] 
+                                for i in triangle], np.int32)
+                    
+                    # Calculate average depth for shading
+                    avg_depth = sum(projected_vertices[i][2] for i in triangle) / 3
+                    depth_color = int(255 * (avg_depth + 1) / 2)
+                    color = (depth_color, depth_color, depth_color)  # Grayscale for mesh surface
+                    
+                    # Draw filled triangle with transparency
+                    overlay = frame.copy()
+                    cv2.fillPoly(overlay, [pts], color)
+                    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)  # Transparency effect
+                    
+                    # Draw triangle edges
+                    cv2.polylines(frame, [pts], True, (0, 255, 255), 1)
+
+            # Draw joints on top of mesh
+            for vertex in projected_vertices:
+                cv2.circle(frame, (vertex[0], vertex[1]), 3, (0, 255, 255), -1)
+
+            # Add mesh render parameters as text
+            cv2.putText(frame, "3D Mesh Visualization", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+            return frame
+            
+        except Exception as e:
+            logger.error(f"Error generating 3D mesh: {str(e)}")
+            return np.zeros((720, 1280, 3), dtype=np.uint8)
+    
+    def _generate_3d_wireframe(self, landmarks):
+        """Generate a 3D wireframe visualization from landmarks"""
+        if not landmarks:
+            return np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        try:
+            # Convert landmarks to MotionBERT format
+            motionbert_input = self._convert_to_motionbert_format(landmarks)
+            
+            # Get 3D pose estimation
+            with torch.no_grad():
+                pose_3d = self.pose_model(motionbert_input)
+            
+            # Create visualization frame
+            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+            
+            # Convert 3D pose to screen coordinates
+            pose_coords = pose_3d.cpu().numpy()[0, 0]  # Shape: (17, 3)
+            
+            # Visualization parameters
+            scale_factor = 200  # Scale factor for 3D to 2D projection
+            center_x, center_y = 640, 360  # Center of the frame
+            depth_scale = 50  # Scale factor for depth visualization
+            
+            # Project 3D coordinates to 2D
+            projected_coords = []
+            for joint in pose_coords:
+                # Simple perspective projection
+                z = joint[2] * depth_scale + 500  # Add offset to avoid division by zero
+                x = int(center_x + (joint[0] * scale_factor * 500) / z)
+                y = int(center_y + (joint[1] * scale_factor * 500) / z)
+                
+                # Store projected coordinates and depth for visualization
+                projected_coords.append((x, y, joint[2]))
+            
+            # Draw joints with depth-based coloring
+            for coord in projected_coords:
+                # Color based on depth (red->blue gradient)
+                depth_color = int(255 * (coord[2] + 1) / 2)  # Normalize to 0-255
+                color = (255 - depth_color, 0, depth_color)  # RGB color
+                cv2.circle(frame, (coord[0], coord[1]), 4, color, -1)
+            
+            # Draw connections between joints
+            for connection in CUSTOM_POSE_CONNECTIONS:
+                start_idx = connection[0]
+                end_idx = connection[1]
+                
+                if (start_idx < len(projected_coords) and 
+                    end_idx < len(projected_coords)):
+                    start = projected_coords[start_idx]
+                    end = projected_coords[end_idx]
+                    
+                    # Calculate average depth for connection color
+                    avg_depth = (start[2] + end[2]) / 2
+                    depth_color = int(255 * (avg_depth + 1) / 2)
+                    color = (255 - depth_color, 0, depth_color)
+                    
+                    cv2.line(frame, 
+                            (start[0], start[1]), 
+                            (end[0], end[1]), 
+                            color, 2)
+            
+            # Add coordinate axes for reference
+            axis_length = 100
+            origin = (50, 670)  # Bottom-left corner
+            cv2.line(frame, origin, (origin[0] + axis_length, origin[1]), (0, 0, 255), 2)  # X-axis
+            cv2.line(frame, origin, (origin[0], origin[1] - axis_length), (0, 255, 0), 2)  # Y-axis
+            cv2.putText(frame, "X", (origin[0] + axis_length + 10, origin[1]), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.putText(frame, "Y", (origin[0], origin[1] - axis_length - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+            return frame
+            
+        except Exception as e:
+            logger.error(f"Error generating 3D wireframe: {str(e)}")
+            return np.zeros((720, 1280, 3), dtype=np.uint8)
         
 class VisualEffects:
     """Handle all visual effects and drawing operations"""
@@ -686,9 +829,10 @@ def cleanup_resources(cap, writer):
 
 @app.post("/process_video/")
 async def process_video(file: UploadFile = File(...)):
+    """Process video and generate three output videos: MediaPipe skeleton, 3D wireframe, and 3D mesh"""
     try:
-        # Validate and setup
-        input_path, output_path, motionbert_output_path, metadata_path = setup_paths(file)
+        # Validate and setup paths for all three videos
+        input_path, mediapipe_path, wireframe_path, mesh_path, metadata_path = setup_paths(file)
 
         # Initialize processors
         model_base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motionbert", "params")
@@ -696,11 +840,12 @@ async def process_video(file: UploadFile = File(...)):
         pose_processor = PoseProcessor(model_base_dir, device)
         visual_effects = VisualEffects()
 
-        # Process video
+        # Process video and generate all three outputs
         metadata = process_video_frames(
             input_path,
-            output_path,
-            motionbert_output_path,
+            mediapipe_path,
+            wireframe_path,
+            mesh_path,
             pose_processor,
             visual_effects
         )
@@ -709,12 +854,25 @@ async def process_video(file: UploadFile = File(...)):
         save_metadata(metadata_path, metadata)
 
         return {
-            "mediapipe_video_url": FileResponse(
-                output_path,
-                media_type="video/mp4",
-                filename=output_path.name
-            ),
-            "motionbert_video_url": str(motionbert_output_path),
+            "status": "success",
+            "videos": {
+                "mediapipe": FileResponse(
+                    mediapipe_path,
+                    media_type="video/mp4",
+                    filename=mediapipe_path.name
+                ),
+                "wireframe": FileResponse(
+                    wireframe_path,
+                    media_type="video/mp4",
+                    filename=wireframe_path.name
+                ),
+                "mesh": FileResponse(
+                    mesh_path,
+                    media_type="video/mp4",
+                    filename=mesh_path.name
+                )
+            },
+            "metadata": str(metadata_path)
         }
 
     except Exception as e:
@@ -724,26 +882,41 @@ async def process_video(file: UploadFile = File(...)):
             detail=f"Video processing failed: {str(e)}"
         )
 
-def process_video_frames(input_path, output_path, motionbert_output_path, pose_processor, visual_effects):
-    """Main video processing function"""
+    finally:
+        # Cleanup temporary files if needed
+        try:
+            if input_path.exists():
+                input_path.unlink()
+        except Exception as e:
+            logger.error(f"Error cleaning up temporary files: {str(e)}")
+
+def process_video_frames(input_path, mediapipe_path, wireframe_path, mesh_path, pose_processor, visual_effects):
+    """Main video processing function for generating three output videos"""
     metadata = {
         "version": "1.0",
         "timestamp": datetime.now().isoformat(),
         "frames": []
     }
 
-    with mp_pose.Pose(
-        min_detection_confidence=CONFIG['MIN_DETECTION_CONFIDENCE'],
-        min_tracking_confidence=CONFIG['MIN_TRACKING_CONFIDENCE']
-    ) as pose:
+    cap = None
+    writers = {
+        'mediapipe': None,
+        'wireframe': None,
+        'mesh': None
+    }
+
+    try:
         cap = cv2.VideoCapture(str(input_path))
-        out = None
-        out_motionbert = None
+        if not cap.isOpened():
+            raise RuntimeError("Failed to open input video")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_count = 0
 
-        try:
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
+        with mp_pose.Pose(
+            min_detection_confidence=CONFIG['MIN_DETECTION_CONFIDENCE'],
+            min_tracking_confidence=CONFIG['MIN_TRACKING_CONFIDENCE']
+        ) as pose:
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
@@ -751,77 +924,88 @@ def process_video_frames(input_path, output_path, motionbert_output_path, pose_p
 
                 frame_count += 1
                 if frame_count % 30 == 0:
-                    logger.info(f"Processing progress: {frame_count}/{total_frames}")
+                    logger.info(f"Processing frame {frame_count}/{total_frames}")
 
                 # Process frame with Mediapipe
-                processed_frame, frame_data = pose_processor.process_frame(
-                    frame,
-                    pose
-                )
+                processed_frame, frame_data = pose_processor.process_frame(frame, pose)
 
                 if frame_data:
-                    # Apply visual effects to Mediapipe video
+                    # Generate MediaPipe visualization
+                    mediapipe_frame = processed_frame.copy()
                     visual_effects.draw_skeleton(
-                        processed_frame,
+                        mediapipe_frame,
                         frame_data['landmarks'],
                         CUSTOM_POSE_CONNECTIONS
                     )
                     visual_effects.draw_angles(
-                        processed_frame,
+                        mediapipe_frame,
                         frame_data['landmarks'],
                         frame_data['angles']
                     )
                     visual_effects.draw_pelvis_origin(
-                        processed_frame,
+                        mediapipe_frame,
                         frame_data['landmarks'],
                         mp_pose
                     )
                     visual_effects.draw_spine_overlay(
-                        processed_frame,
+                        mediapipe_frame,
                         frame_data['landmarks'],
                         mp_pose
                     )
 
+                    # Generate 3D wireframe visualization
+                    wireframe_frame = pose_processor._generate_3d_wireframe(
+                        frame_data['landmarks']
+                    )
+
+                    # Generate 3D mesh visualization
+                    mesh_frame = pose_processor._add_3d_mesh(
+                        frame_data['landmarks']
+                    )
+
+                    # Initialize video writers if not already done
+                    if writers['mediapipe'] is None:
+                        writers['mediapipe'] = initialize_video_writer(
+                            mediapipe_path, cap, mediapipe_frame.shape
+                        )
+                    if writers['wireframe'] is None:
+                        writers['wireframe'] = initialize_video_writer(
+                            wireframe_path, cap, wireframe_frame.shape
+                        )
+                    if writers['mesh'] is None:
+                        writers['mesh'] = initialize_video_writer(
+                            mesh_path, cap, mesh_frame.shape
+                        )
+
+                    # Write frames to respective videos
+                    writers['mediapipe'].write(mediapipe_frame)
+                    writers['wireframe'].write(wireframe_frame)
+                    writers['mesh'].write(mesh_frame)
+
                     # Update metadata
                     frame_metadata = {
+                        "frame_number": frame_count,
                         "timestamp": cap.get(cv2.CAP_PROP_POS_MSEC),
-                        "landmarks": None,
-                        "angles": None,
-                        "velocities": None,
-                        "motionbert_results": None,
+                        "landmarks": frame_data.get('landmarks'),
+                        "angles": frame_data.get('angles'),
+                        "velocities": frame_data.get('velocities'),
+                        "motionbert_results": frame_data.get('motionbert_results')
                     }
-                    if frame_data:
-                        frame_metadata.update(frame_data)
                     metadata["frames"].append(frame_metadata)
 
-                    # Generate 3D mesh frame
-                    mesh_frame = pose_processor._add_3d_mesh(
-                        frame_data['landmarks'],
-                    )
+    except Exception as e:
+        logger.error(f"Error processing video: {str(e)}")
+        raise
 
-                # Initialize video writer if needed
-                if out is None:
-                    out = initialize_video_writer(
-                        output_path,
-                        cap,
-                        processed_frame.shape
-                    )
-
-                if out_motionbert is None:
-                    out_motionbert = initialize_video_writer(
-                        motionbert_output_path,
-                        cap,
-                        mesh_frame.shape
-                    )
-                
-
-                # Write frames to respective videos
-                out.write(processed_frame)
-                out_motionbert.write(mesh_frame)
-
-        finally:
-            cleanup_resources(cap, out)
-            cleanup_resources(None, out_motionbert)  # Close second writer if open
-
+    finally:
+        # Clean up resources
+        if cap is not None:
+            cap.release()
+        
+        for writer in writers.values():
+            if writer is not None:
+                writer.release()
+        
+        cv2.destroyAllWindows()
 
     return metadata
