@@ -14,21 +14,12 @@ import json
 from filterpy.kalman import KalmanFilter
 import logging
 import torch
-from motionbert_models import (
-    load_motionbert_model,
-    load_pose_model,
-    load_action_models,
-    load_mesh_model,
-)
+from motionbert_models import load_motionbert_model, load_pose_model, load_mesh_model
 
 # Add MotionBERT/lib to sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
 motionbert_path = os.path.join(script_dir, "MotionBERT", "lib")
 sys.path.append(motionbert_path)
-print("Python search path:", sys.path)
-
-from model.DSTformer import DSTformer  # Backbone for MotionBERT
-from model.model_action import ActionNet  # For action recognition
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -43,7 +34,6 @@ CONFIG = {
     'AXIS_SCALE': 0.2,
     'AXIS_OPACITY': 0.5,
     'SKELETON_SAVE_INTERVAL': 30,
-    'SMOOTHING_WINDOW': 5,
 }
 
 # Define custom pose connections (excluding face landmarks)
@@ -56,7 +46,8 @@ CUSTOM_POSE_CONNECTIONS = set([
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_FOLDER = BASE_DIR / "uploads"
 PROCESSED_FOLDER = BASE_DIR / "processed" / "app_hug"
-MOTIONBERT_FOLDER = BASE_DIR / "processed" / "3d_mesh"
+WIREFRAME_FOLDER = BASE_DIR / "processed" / "wireframe"
+MESH_FOLDER = BASE_DIR / "processed" / "3d_mesh"
 META_FOLDER = PROCESSED_FOLDER / "meta"
 
 # Ensure folders exist
@@ -77,11 +68,14 @@ class PoseProcessor:
         self.motion_trails = defaultdict(lambda: deque(maxlen=CONFIG['MOTION_TRAIL_LENGTH']))
         self.motion_history = defaultdict(list)
         self.previous_landmarks = None
+        self.device = device
 
-        # Load models using the consolidated function
+        # Load models
         try:
-            self.motionbert_model, self.action_model = load_motionbert_models(model_base_dir, device)
-            print("All models loaded successfully!")
+            self.motionbert_model = load_motionbert_model(model_base_dir, device)
+            self.pose_model = load_pose_model(model_base_dir, device)
+            self.mesh_model = load_mesh_model(model_base_dir, device)
+            logger.info("All models loaded successfully!")
         except Exception as e:
             logger.error(f"Failed to load models: {e}")
             raise
@@ -90,10 +84,8 @@ class PoseProcessor:
         """Initialize Kalman filters for each landmark"""
         filters = {}
         for i in range(33):
-            kf = KalmanFilter(dim_x=6, dim_z=3)  # State: [x, dx, ddx, y, dy, ddy], Measurement: [x, y, z]
-
-            # State transition matrix (6x6)
-            dt = 1.0  # time step
+            kf = KalmanFilter(dim_x=6, dim_z=3)
+            dt = 1.0
             kf.F = np.array([
                 [1, dt, 0.5*dt**2, 0, 0, 0],
                 [0, 1, dt, 0, 0, 0],
@@ -102,27 +94,15 @@ class PoseProcessor:
                 [0, 0, 0, 0, 1, dt],
                 [0, 0, 0, 0, 0, 1]
             ])
-
-            # Measurement matrix (3x6)
             kf.H = np.array([
                 [1, 0, 0, 0, 0, 0],
                 [0, 0, 0, 1, 0, 0],
                 [0, 0, 0, 0, 0, 1]
             ])
-
-            # Measurement noise covariance (3x3)
-            kf.R = np.eye(3) * 0.005  # Reduced measurement noise
-
-            # Process noise covariance (6x6)
-            q = 0.05  # process noise
-            kf.Q = np.eye(6) * q   # Adjusted process noise
-
-            # Initial state covariance (6x6)
-            kf.P = np.eye(6) * 50 # Initial state uncertainty
-
-            # Initial state (6x1)
+            kf.R = np.eye(3) * 0.005
+            kf.Q = np.eye(6) * 0.05
+            kf.P = np.eye(6) * 50
             kf.x = np.zeros((6, 1))
-            
             filters[i] = kf
         return filters
 
@@ -301,80 +281,107 @@ class PoseProcessor:
                     cv2.circle(frame, pos, int(velocity), (0, 255, 255), 1)
 
         return frame
-        
-    def _add_3d_mesh(self, landmarks):
-        """Generate a 3D mesh from landmarks."""
+
+    def _convert_to_motionbert_format(self, landmarks):
+        """Convert MediaPipe landmarks to MotionBERT input format"""
         if not landmarks:
-            raise ValueError("Landmarks are required to generate 3D mesh.")
+            return None
+
+        # MotionBERT expects input shape: (batch_size, frames, joints, coords)
+        # We're processing single frames, so frames dimension will be 1
+        converted = np.zeros((1, 1, 17, 3))
+        
+        # MediaPipe to MotionBERT joint mapping
+        # Only including the relevant body joints (not face)
+        joint_mapping = {
+            11: 0,  # LEFT_SHOULDER
+            12: 1,  # RIGHT_SHOULDER
+            13: 2,  # LEFT_ELBOW
+            14: 3,  # RIGHT_ELBOW
+            15: 4,  # LEFT_WRIST
+            16: 5,  # RIGHT_WRIST
+            23: 6,  # LEFT_HIP
+            24: 7,  # RIGHT_HIP
+            25: 8,  # LEFT_KNEE
+            26: 9,  # RIGHT_KNEE
+            27: 10, # LEFT_ANKLE
+            28: 11, # RIGHT_ANKLE
+            29: 12, # LEFT_HEEL
+            30: 13, # RIGHT_HEEL
+            31: 14, # LEFT_FOOT_INDEX
+            32: 15, # RIGHT_FOOT_INDEX
+            0: 16,  # NOSE
+        }
+
+        for mp_idx, mb_idx in joint_mapping.items():
+            if mp_idx < len(landmarks) and landmarks[mp_idx] is not None:
+                converted[0, 0, mb_idx] = landmarks[mp_idx][:3]
+
+        return torch.tensor(converted, dtype=torch.float32, device=self.device)
+
+    def process_with_motionbert(self, landmarks):
+        """Process landmarks with MotionBERT for 3D pose estimation and mesh generation"""
+        if not landmarks:
+            return None
 
         try:
-            # Convert landmarks to the correct format
-            landmark_tensor = torch.tensor(
-                [[lm[:3] for lm in landmarks]], 
-                dtype=torch.float32,
-                device=self.device
-            )
+            # Convert landmarks to MotionBERT format
+            motionbert_input = self._convert_to_motionbert_format(landmarks)
             
-            # Process through mesh model
             with torch.no_grad():
-                mesh_output = self.mesh_model(landmark_tensor)
+                # Get 3D pose
+                pose_3d = self.pose_model(motionbert_input)
+                
+                # Generate mesh
+                mesh_features = self.mesh_model(motionbert_input)
+
+            return {
+                "pose_3d": pose_3d.cpu().numpy().tolist(),
+                "mesh_features": mesh_features.cpu().numpy().tolist()
+            }
+
+        except Exception as e:
+            logger.error(f"Error during MotionBERT processing: {str(e)}")
+            return {"error": f"MotionBERT processing failed: {str(e)}"}
+
+    def _add_3d_mesh(self, landmarks):
+        """Generate a 3D mesh visualization from landmarks"""
+        if not landmarks:
+            return np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        try:
+            # Convert landmarks to MotionBERT format
+            motionbert_input = self._convert_to_motionbert_format(landmarks)
             
-            # Convert output to numpy for visualization
-            mesh_result = mesh_output.cpu().numpy()
+            # Generate mesh
+            with torch.no_grad():
+                mesh_output = self.mesh_model(motionbert_input)
             
             # Create visualization frame
             frame = np.zeros((720, 1280, 3), dtype=np.uint8)
             
-            # Add your mesh visualization code here
-            # This will depend on the output format of your mesh model
-            # Example placeholder visualization:
-            for vertex in mesh_result[0]:  # Assuming mesh_result[0] contains vertices
-                x, y = int(vertex[0] * 640 + 640), int(vertex[1] * 360 + 360)
+            # Convert mesh output to screen coordinates
+            mesh_coords = mesh_output.cpu().numpy()[0, 0]  # Shape: (17, 3)
+            for vertex in mesh_coords:
+                x = int(vertex[0] * 640 + 640)
+                y = int(vertex[1] * 360 + 360)
                 if 0 <= x < 1280 and 0 <= y < 720:
-                    cv2.circle(frame, (x, y), 1, (255, 255, 255), -1)
+                    cv2.circle(frame, (x, y), 3, (255, 255, 255), -1)
+                    
+            # Draw connections between joints
+            for start, end in CUSTOM_POSE_CONNECTIONS:
+                if start < len(mesh_coords) and end < len(mesh_coords):
+                    start_point = (int(mesh_coords[start][0] * 640 + 640),
+                                 int(mesh_coords[start][1] * 360 + 360))
+                    end_point = (int(mesh_coords[end][0] * 640 + 640),
+                               int(mesh_coords[end][1] * 360 + 360))
+                    cv2.line(frame, start_point, end_point, (0, 255, 0), 2)
             
             return frame
             
         except Exception as e:
             logger.error(f"Error generating 3D mesh: {str(e)}")
-            # Return a blank frame in case of error
             return np.zeros((720, 1280, 3), dtype=np.uint8)
-
-    def process_with_motionbert(self, landmarks):
-        """Process landmarks with MotionBERT for action recognition and 3D pose."""
-        if not landmarks:
-            return None
-
-        try:
-            # Convert landmarks to expected format (1, 1, 243, 17, 3)
-            # Note: We'll implement the proper conversion in the next step
-            # This is just a placeholder to show the processing flow
-            sequence = torch.tensor([[[landmarks]]], dtype=torch.float32).to(self.device)
-            
-            # Get motion representation
-            with torch.no_grad():
-                motion_features = self.motionbert_model.get_representation(sequence.squeeze(1))
-                
-                # Get action recognition
-                action_output = self.action_model(sequence)
-                action_probs = torch.softmax(action_output, dim=1)
-                recognized_action = int(torch.argmax(action_probs))
-                
-                # Get 3D pose representation
-                pose_3d = self.motionbert_model(sequence.squeeze(1))
-
-            return {
-                "action": recognized_action,
-                "action_confidence": float(torch.max(action_probs).cpu()),
-                "pose_3d": pose_3d.cpu().numpy().tolist(),
-                "motion_features": motion_features.cpu().numpy().tolist()
-            }
-
-        except Exception as e:
-            logger.error(f"Error during MotionBERT processing: {str(e)}")
-            return {
-                "error": f"MotionBERT processing failed: {str(e)}"
-            }
 
     def process_frame(self, frame, pose):
         """Process a single frame"""
@@ -607,22 +614,34 @@ def setup_paths(file: UploadFile):
     """Setup input, output and metadata paths for video processing"""
     timestamp = datetime.now().strftime("%m%d%Y_%H%M%S")
     input_path = UPLOAD_FOLDER / file.filename
-    output_filename = f"processed_{timestamp}_{file.filename}"
-    output_path = PROCESSED_FOLDER / output_filename
+    
+    # Setup output paths for each video type
+    mediapipe_filename = f"mediapipe_{timestamp}_{file.filename}"
+    wireframe_filename = f"wireframe_{timestamp}_{file.filename}"
+    mesh_filename = f"mesh_{timestamp}_{file.filename}"
+    
+    mediapipe_path = PROCESSED_FOLDER / mediapipe_filename
+    wireframe_path = WIREFRAME_FOLDER / wireframe_filename
+    mesh_path = MESH_FOLDER / mesh_filename
 
-    # 3D mesh video path
-    motionbert_folder = MOTIONBERT_FOLDER
-    motionbert_folder.mkdir(parents=True, exist_ok=True)
-    motionbert_output_path = motionbert_folder / f"mesh_{timestamp}_{file.filename}"
+    # Ensure all output directories exist
+    PROCESSED_FOLDER.mkdir(parents=True, exist_ok=True)
+    WIREFRAME_FOLDER.mkdir(parents=True, exist_ok=True)
+    MESH_FOLDER.mkdir(parents=True, exist_ok=True)
+    META_FOLDER.mkdir(parents=True, exist_ok=True)
 
     # Metadata path
     metadata_path = META_FOLDER / f"{timestamp}_metadata.json"
 
-    # Save uploaded file
-    with open(input_path, "wb") as f:
-        f.write(file.file.read())
+    try:
+        # Save uploaded file
+        with open(input_path, "wb") as f:
+            f.write(file.file.read())
+    except Exception as e:
+        logger.error(f"Error saving uploaded file: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
 
-    return input_path, output_path, motionbert_output_path, metadata_path
+    return input_path, mediapipe_path, wireframe_path, mesh_path, metadata_path
 
 def save_metadata(metadata_path: Path, metadata: dict):
     """Save metadata to JSON file"""
