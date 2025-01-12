@@ -18,7 +18,7 @@ app = FastAPI()
 # Directories for saving uploaded and processed videos (relative to the project root)
 BASE_DIR = Path(__file__).resolve().parent.parent  # Navigate one level up
 UPLOAD_FOLDER = BASE_DIR / "uploads"
-PROCESSED_FOLDER = BASE_DIR / "processed"
+PROCESSED_FOLDER = BASE_DIR / "processed" / "backend_fresh" / "main"
 META_FOLDER = PROCESSED_FOLDER / "meta"
 
 # Ensure folders exist
