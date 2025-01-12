@@ -46,9 +46,9 @@ CUSTOM_POSE_CONNECTIONS = set([
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_FOLDER = BASE_DIR / "uploads"
 PROCESSED_FOLDER = BASE_DIR / "processed" / "app_hug"
-WIREFRAME_FOLDER = BASE_DIR / "processed" / "wireframe"
-MESH_FOLDER = BASE_DIR / "processed" / "3d_mesh"
-META_FOLDER = PROCESSED_FOLDER / "meta"
+WIREFRAME_FOLDER = BASE_DIR / PROCESSED_FOLDER / "wireframe"
+MESH_FOLDER = BASE_DIR / PROCESSED_FOLDER / "3d_mesh"
+META_FOLDER = PROCESSED_FOLDER / PROCESSED_FOLDER / "meta"
 
 # Ensure folders exist
 for folder in [UPLOAD_FOLDER, PROCESSED_FOLDER, META_FOLDER]:
