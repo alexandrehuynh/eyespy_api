@@ -344,45 +344,6 @@ class PoseProcessor:
             logger.error(f"Error during MotionBERT processing: {str(e)}")
             return {"error": f"MotionBERT processing failed: {str(e)}"}
 
-    def _add_3d_mesh(self, landmarks):
-        """Generate a 3D mesh visualization from landmarks"""
-        if not landmarks:
-            return np.zeros((720, 1280, 3), dtype=np.uint8)
-
-        try:
-            # Convert landmarks to MotionBERT format
-            motionbert_input = self._convert_to_motionbert_format(landmarks)
-            
-            # Generate mesh
-            with torch.no_grad():
-                mesh_output = self.mesh_model(motionbert_input)
-            
-            # Create visualization frame
-            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-            
-            # Convert mesh output to screen coordinates
-            mesh_coords = mesh_output.cpu().numpy()[0, 0]  # Shape: (17, 3)
-            for vertex in mesh_coords:
-                x = int(vertex[0] * 640 + 640)
-                y = int(vertex[1] * 360 + 360)
-                if 0 <= x < 1280 and 0 <= y < 720:
-                    cv2.circle(frame, (x, y), 3, (255, 255, 255), -1)
-                    
-            # Draw connections between joints
-            for start, end in CUSTOM_POSE_CONNECTIONS:
-                if start < len(mesh_coords) and end < len(mesh_coords):
-                    start_point = (int(mesh_coords[start][0] * 640 + 640),
-                                 int(mesh_coords[start][1] * 360 + 360))
-                    end_point = (int(mesh_coords[end][0] * 640 + 640),
-                               int(mesh_coords[end][1] * 360 + 360))
-                    cv2.line(frame, start_point, end_point, (0, 255, 0), 2)
-            
-            return frame
-            
-        except Exception as e:
-            logger.error(f"Error generating 3D mesh: {str(e)}")
-            return np.zeros((720, 1280, 3), dtype=np.uint8)
-
     def process_frame(self, frame, pose):
         """Process a single frame"""
         # Convert the BGR image to RGB
@@ -959,7 +920,7 @@ def process_video_frames(input_path, mediapipe_path, wireframe_path, mesh_path, 
                     )
 
                     # Generate 3D mesh visualization
-                    mesh_frame = pose_processor._add_3d_mesh(
+                    mesh_frame = pose_processor._generate_3d_mesh_frame(
                         frame_data['landmarks']
                     )
 
