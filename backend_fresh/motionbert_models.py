@@ -121,9 +121,14 @@ class SimplifiedDSTformer(torch.nn.Module):
         self.num_joints = num_joints
         self.in_channels = in_channels
         
-        # Simplified architecture matching the pretrained model
-        self.input_projection = torch.nn.Linear(in_channels, 128)
+        # Initialize the model layers
+        # Input projection: takes flattened joints*channels (17*3=51) to transformer dim (128)
+        self.input_projection = torch.nn.Linear(in_channels * num_joints, 128)
+        
+        # Positional encoding for transformer
         self.positional_encoding = SimplePositionalEncoding(128)
+        
+        # Transformer encoder layers
         self.transformer = torch.nn.TransformerEncoder(
             torch.nn.TransformerEncoderLayer(
                 d_model=128,
@@ -133,23 +138,45 @@ class SimplifiedDSTformer(torch.nn.Module):
             ),
             num_layers=4
         )
-        self.output_projection = torch.nn.Linear(128, 3)
+        
+        # Output projection: transforms back from transformer dim (128) to joints*3 (17*3=51)
+        # We multiply by 3 because we want x,y,z coordinates for each joint
+        self.output_projection = torch.nn.Linear(128, num_joints * 3)
         
     def forward(self, x):
         # Input shape: [batch_size, sequence_length, num_joints, channels]
+        # e.g., [1, 1, 17, 3]
         B, T, J, C = x.shape
-        x = x.view(B, T, J * C)  # Flatten joints and channels
+        
+        # Reshape to combine batch and sequence, flatten joints and channels
+        # From [1, 1, 17, 3] to [1, 51]
+        x = x.reshape(B * T, J * C)
         
         # Project to transformer dimension
+        # From [1, 51] to [1, 128]
         x = self.input_projection(x)
+        
+        # Reshape back to include sequence dimension for transformer
+        # From [1, 128] to [1, 1, 128]
+        x = x.reshape(B, T, -1)
+        
+        # Add positional encoding
         x = self.positional_encoding(x)
         
-        # Apply transformer
+        # Apply transformer - shape remains [1, 1, 128]
         x = self.transformer(x)
         
+        # Reshape for final projection
+        # From [1, 1, 128] to [1, 128]
+        x = x.reshape(B * T, -1)
+        
         # Project back to 3D coordinates
+        # From [1, 128] to [1, 51]
         x = self.output_projection(x)
-        x = x.view(B, T, J, -1)  # Reshape back to [batch, time, joints, 3]
+        
+        # Reshape back to [batch, time, joints, 3]
+        # From [1, 51] to [1, 1, 17, 3]
+        x = x.reshape(B, T, J, -1)
         
         return x
 

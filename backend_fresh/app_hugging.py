@@ -287,37 +287,62 @@ class PoseProcessor:
         if not landmarks:
             return None
 
-        # MotionBERT expects input shape: (batch_size, frames, joints, coords)
-        # We're processing single frames, so frames dimension will be 1
-        converted = np.zeros((1, 1, 17, 3))
-        
-        # MediaPipe to MotionBERT joint mapping
-        # Only including the relevant body joints (not face)
-        joint_mapping = {
-            11: 0,  # LEFT_SHOULDER
-            12: 1,  # RIGHT_SHOULDER
-            13: 2,  # LEFT_ELBOW
-            14: 3,  # RIGHT_ELBOW
-            15: 4,  # LEFT_WRIST
-            16: 5,  # RIGHT_WRIST
-            23: 6,  # LEFT_HIP
-            24: 7,  # RIGHT_HIP
-            25: 8,  # LEFT_KNEE
-            26: 9,  # RIGHT_KNEE
-            27: 10, # LEFT_ANKLE
-            28: 11, # RIGHT_ANKLE
-            29: 12, # LEFT_HEEL
-            30: 13, # RIGHT_HEEL
-            31: 14, # LEFT_FOOT_INDEX
-            32: 15, # RIGHT_FOOT_INDEX
-            0: 16,  # NOSE
-        }
+        try:
+            # Initialize output array: [batch_size, frames, joints, coords]
+            converted = np.zeros((1, 1, 17, 3))
+            
+            # MediaPipe to MotionBERT joint mapping
+            # Only including the relevant body joints (not face)
+            joint_mapping = {
+                11: 0,  # LEFT_SHOULDER
+                12: 1,  # RIGHT_SHOULDER
+                13: 2,  # LEFT_ELBOW
+                14: 3,  # RIGHT_ELBOW
+                15: 4,  # LEFT_WRIST
+                16: 5,  # RIGHT_WRIST
+                23: 6,  # LEFT_HIP
+                24: 7,  # RIGHT_HIP
+                25: 8,  # LEFT_KNEE
+                26: 9,  # RIGHT_KNEE
+                27: 10, # LEFT_ANKLE
+                28: 11, # RIGHT_ANKLE
+                29: 12, # LEFT_HEEL
+                30: 13, # RIGHT_HEEL
+                31: 14, # LEFT_FOOT_INDEX
+                32: 15, # RIGHT_FOOT_INDEX
+                0: 16,  # NOSE
+            }
 
-        for mp_idx, mb_idx in joint_mapping.items():
-            if mp_idx < len(landmarks) and landmarks[mp_idx] is not None:
-                converted[0, 0, mb_idx] = landmarks[mp_idx][:3]
+            # Convert coordinates
+            for mp_idx, mb_idx in joint_mapping.items():
+                if mp_idx < len(landmarks) and landmarks[mp_idx] is not None:
+                    # Extract coordinates and normalize
+                    coords = np.array(landmarks[mp_idx][:3])  # x, y, z
+                    
+                    # Normalize coordinates to [-1, 1] range
+                    coords[0] = (coords[0] - 640) / 640  # Assuming 1280x720 frame
+                    coords[1] = (coords[1] - 360) / 360
+                    coords[2] = coords[2] / 100  # Normalize depth
+                    
+                    converted[0, 0, mb_idx] = coords
 
-        return torch.tensor(converted, dtype=torch.float32, device=self.device)
+            # Convert to tensor and ensure correct shape
+            tensor_input = torch.tensor(converted, dtype=torch.float32, device=self.device)
+            
+            # Add extra dummy frame dimension if needed
+            if len(tensor_input.shape) == 3:
+                tensor_input = tensor_input.unsqueeze(1)
+
+            # Debug output
+            logger.info(f"Input tensor shape: {tensor_input.shape}")
+            logger.info(f"Input tensor device: {tensor_input.device}")
+            
+            return tensor_input
+
+        except Exception as e:
+            logger.error(f"Error converting landmarks to MotionBERT format: {str(e)}")
+            logger.error(f"Landmark shape: {np.array(landmarks).shape if landmarks else 'None'}")
+            return None
 
     def process_with_motionbert(self, landmarks):
         """Process landmarks with MotionBERT for 3D pose estimation and mesh generation"""
