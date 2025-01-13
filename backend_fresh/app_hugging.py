@@ -551,12 +551,17 @@ class PoseProcessor:
             for i, coord in enumerate(projected_coords):
                 if 0 <= coord[0] < 1280 and 0 <= coord[1] < 720:
                     # Size based on depth (closer joints are larger)
-                    size = int(6 * (1 + coord[2]))
+                    depth = max(-1.0, min(1.0, coord[2]))  # Clamp depth between -1.0 and 1.0
+                    size = int(6 * (1 + depth))
                     # Color based on depth (closer joints are brighter)
                     brightness = int(255 * (1 - abs(coord[2])))
                     color = (0, brightness, 255)  # Cyan color scheme
                     
-                    cv2.circle(frame, (int(coord[0]), int(coord[1])), size, color, -1)
+                    # Ensure coordinates are within frame bounds
+                    x = max(0, min(1279, int(coord[0])))
+                    y = max(0, min(719, int(coord[1])))
+                    cv2.circle(frame, (x, y), size, color, -1)
+                    # cv2.circle(frame, (int(coord[0]), int(coord[1])), size, color, -1)
             
             # Add coordinate system
             axis_length = 100
