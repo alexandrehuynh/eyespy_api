@@ -551,77 +551,99 @@ class MotionBERTProcessor:
             return np.zeros((720, 1280, 3), dtype=np.uint8)
 
         try:
-            # Create visualization frame with white grid on dark background
+            # Create visualization frame with dark background
             frame = np.ones((720, 1280, 3), dtype=np.uint8) * 32
             
-            # Draw grid (optional)
-            grid_color = (64, 64, 64)  # Light grey
-            grid_spacing = 100
+            # Draw subtle grid
+            grid_color = (45, 45, 45)
+            grid_spacing = 80
             for x in range(0, frame.shape[1], grid_spacing):
                 cv2.line(frame, (x, 0), (x, frame.shape[0]), grid_color, 1)
             for y in range(0, frame.shape[0], grid_spacing):
                 cv2.line(frame, (0, y), (frame.shape[1], y), grid_color, 1)
+
+            # Define the skeleton hierarchy for proper human form
+            skeleton = {
+                'torso': [
+                    (0, 7),   # Hip to mid-spine
+                    (7, 8),   # Mid-spine to shoulders
+                    (8, 9),   # Shoulders to neck
+                    (9, 10)   # Neck to head
+                ],
+                'right_arm': [
+                    (8, 11),  # Shoulder to elbow
+                    (11, 12), # Elbow to wrist
+                    (12, 13)  # Wrist to hand
+                ],
+                'left_arm': [
+                    (8, 14),  # Shoulder to elbow
+                    (14, 15), # Elbow to wrist
+                    (15, 16)  # Wrist to hand
+                ],
+                'right_leg': [
+                    (0, 1),   # Hip to knee
+                    (1, 2),   # Knee to ankle
+                    (2, 3)    # Ankle to foot
+                ],
+                'left_leg': [
+                    (0, 4),   # Hip to knee
+                    (4, 5),   # Knee to ankle
+                    (5, 6)    # Ankle to foot
+                ]
+            }
+
+            # Project 3D points with better scaling and centering
+            focal_length = 2500  # Increased for better depth perception
+            center = np.array([frame.shape[1]//2, frame.shape[0]//2])
             
-            # Define H36M skeleton with clear body segments
-            skeleton_segments = [
-                # Torso
-                [(0, 7), (7, 8), (8, 9), (9, 10)],  # Spine
-                # Right arm
-                [(8, 11), (11, 12), (12, 13)],
-                # Left arm
-                [(8, 14), (14, 15), (15, 16)],
-                # Right leg
-                [(0, 1), (1, 2), (2, 3)],
-                # Left leg
-                [(0, 4), (4, 5), (5, 6)]
-            ]
+            # Normalize and center the pose
+            pose_3d = pose_3d - pose_3d[0]  # Center around hip
+            scale = 300  # Increased scale for better visibility
             
-            # Project 3D points to 2D
-            focal_length = 1000  # Adjust for depth perception
-            principal_point = np.array([frame.shape[1]//2, frame.shape[0]//2])
+            # Apply perspective projection
             points_2d = []
-            
+            z_depths = []
             for point in pose_3d:
-                # Scale points for better visualization
-                x, y, z = point * 100  # Scale factor
+                x, y, z = point * scale
                 
-                # Apply perspective projection
-                x_proj = (x * focal_length / (z + focal_length)) + principal_point[0]
-                y_proj = (y * focal_length / (z + focal_length)) + principal_point[1]
+                # Adjust coordinate system
+                x_proj = (x * focal_length / (z + focal_length)) + center[0]
+                y_proj = (y * focal_length / (z + focal_length)) + center[1]
                 
                 points_2d.append((int(x_proj), int(y_proj)))
-            
-            # Draw skeleton
-            line_color = (255, 128, 0)  # Blue color for skeleton
-            for segment_group in skeleton_segments:
-                for start_idx, end_idx in segment_group:
+                z_depths.append(z)
+
+            # Draw skeleton by body parts
+            figure_color = (255, 128, 0)  # Blue
+            line_thickness = 3  # Consistent thickness for clarity
+
+            # Draw skeleton parts in specific order for proper overlapping
+            for part_name, connections in skeleton.items():
+                for start_idx, end_idx in connections:
                     start_point = points_2d[start_idx]
                     end_point = points_2d[end_idx]
                     
-                    # Calculate line thickness based on z-coordinate (depth)
-                    z_avg = (pose_3d[start_idx][2] + pose_3d[end_idx][2]) / 2
-                    thickness = max(1, int(4 * (1 - z_avg/np.max(np.abs(pose_3d[:, 2])))))
-                    
-                    # Draw line with anti-aliasing
-                    cv2.line(frame, start_point, end_point, line_color, thickness, cv2.LINE_AA)
-            
+                    # Draw thicker lines for torso
+                    thickness = line_thickness + 1 if part_name == 'torso' else line_thickness
+                    cv2.line(frame, start_point, end_point, figure_color, thickness, cv2.LINE_AA)
+
             # Draw joints
             for i, point in enumerate(points_2d):
-                # Calculate joint size based on depth
-                z_depth = pose_3d[i][2]
-                joint_size = max(2, int(6 * (1 - z_depth/np.max(np.abs(pose_3d[:, 2])))))
+                # Larger joints for key points (hips, shoulders, head)
+                is_major_joint = i in [0, 7, 8, 9, 10]
+                joint_size = 6 if is_major_joint else 4
                 
                 # Draw joint
-                cv2.circle(frame, point, joint_size, line_color, -1, cv2.LINE_AA)
-                cv2.circle(frame, point, joint_size-1, (128, 64, 0), -1, cv2.LINE_AA)  # Inner circle
-            
+                cv2.circle(frame, point, joint_size, figure_color, -1, cv2.LINE_AA)
+                cv2.circle(frame, point, joint_size-1, (153, 77, 0), -1, cv2.LINE_AA)
+
             return frame
             
         except Exception as e:
             logger.error(f"Error generating wireframe: {str(e)}")
             traceback.print_exc()
             return np.zeros((720, 1280, 3), dtype=np.uint8)
-        
+            
     def generate_mesh(self, mesh_features):
         """Generate 3D mesh visualization using mesh features"""
         if mesh_features is None:
