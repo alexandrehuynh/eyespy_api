@@ -498,6 +498,36 @@ class VisualEffects:
 class MotionBERTProcessor:
     def __init__(self, model_base_dir, device):
         self.device = device
+
+        # Define skeleton as class attribute
+        self.skeleton = {
+            'torso': [
+                (0, 7),   # Hip to mid-spine
+                (7, 8),   # Mid-spine to shoulders
+                (8, 9),   # Shoulders to neck
+                (9, 10)   # Neck to head
+            ],
+            'right_arm': [
+                (8, 11),  # Shoulder to elbow
+                (11, 12), # Elbow to wrist
+                (12, 13)  # Wrist to hand
+            ],
+            'left_arm': [
+                (8, 14),  # Shoulder to elbow
+                (14, 15), # Elbow to wrist
+                (15, 16)  # Wrist to hand
+            ],
+            'right_leg': [
+                (0, 1),   # Hip to knee
+                (1, 2),   # Knee to ankle
+                (2, 3)    # Ankle to foot
+            ],
+            'left_leg': [
+                (0, 4),   # Hip to knee
+                (4, 5),   # Knee to ankle
+                (5, 6)    # Ankle to foot
+            ]
+        }
         
         try:
             self.pose_model = load_pose_model(model_base_dir, device)
@@ -548,6 +578,7 @@ class MotionBERTProcessor:
     def generate_wireframe(self, pose_3d):
         """Generate 3D wireframe visualization using pose data in MotionBERT style"""
         if pose_3d is None:
+            logger.error("pose_3d is None")
             return np.zeros((720, 1280, 3), dtype=np.uint8)
 
         try:
@@ -562,83 +593,75 @@ class MotionBERTProcessor:
             for y in range(0, frame.shape[0], grid_spacing):
                 cv2.line(frame, (0, y), (frame.shape[1], y), grid_color, 1)
 
-            # Define the skeleton hierarchy for proper human form
-            skeleton = {
-                'torso': [
-                    (0, 7),   # Hip to mid-spine
-                    (7, 8),   # Mid-spine to shoulders
-                    (8, 9),   # Shoulders to neck
-                    (9, 10)   # Neck to head
-                ],
-                'right_arm': [
-                    (8, 11),  # Shoulder to elbow
-                    (11, 12), # Elbow to wrist
-                    (12, 13)  # Wrist to hand
-                ],
-                'left_arm': [
-                    (8, 14),  # Shoulder to elbow
-                    (14, 15), # Elbow to wrist
-                    (15, 16)  # Wrist to hand
-                ],
-                'right_leg': [
-                    (0, 1),   # Hip to knee
-                    (1, 2),   # Knee to ankle
-                    (2, 3)    # Ankle to foot
-                ],
-                'left_leg': [
-                    (0, 4),   # Hip to knee
-                    (4, 5),   # Knee to ankle
-                    (5, 6)    # Ankle to foot
-                ]
-            }
+            # Log initial pose data
+            logger.info(f"Initial pose shape: {pose_3d.shape}")
+            logger.info(f"Initial pose range: min={pose_3d.min():.2f}, max={pose_3d.max():.2f}")
 
             # Project 3D points with better scaling and centering
-            focal_length = 2500  # Increased for better depth perception
+            focal_length = 2500
             center = np.array([frame.shape[1]//2, frame.shape[0]//2])
+            logger.info(f"Projection parameters: focal={focal_length}, center={center}")
             
-            # Normalize and center the pose
-            pose_3d = pose_3d - pose_3d[0]  # Center around hip
-            scale = 300  # Increased scale for better visibility
+            # Normalize and center the pose with logging
+            pose_centered = pose_3d - pose_3d[0]  # Center around hip
+            logger.info(f"After centering: min={pose_centered.min():.2f}, max={pose_centered.max():.2f}")
             
-            # Apply perspective projection
+            scale = 300
+            logger.info(f"Using scale factor: {scale}")
+            
+            # Apply perspective projection with logging
             points_2d = []
             z_depths = []
-            for point in pose_3d:
+            for i, point in enumerate(pose_centered):
                 x, y, z = point * scale
                 
                 # Adjust coordinate system
                 x_proj = (x * focal_length / (z + focal_length)) + center[0]
                 y_proj = (y * focal_length / (z + focal_length)) + center[1]
                 
+                # Log first few points before clipping
+                if i < 3:
+                    logger.info(f"Point {i} projected to: ({x_proj:.1f}, {y_proj:.1f})")
+                
                 points_2d.append((int(x_proj), int(y_proj)))
                 z_depths.append(z)
 
-            # Draw skeleton by body parts
+            # Draw skeleton
             figure_color = (255, 128, 0)  # Blue
             line_thickness = 3  # Consistent thickness for clarity
 
-            # Draw skeleton parts in specific order for proper overlapping
-            for part_name, connections in skeleton.items():
+            # Draw skeleton parts with logging
+            for part_name, connections in self.skeleton.items():
+                logger.info(f"Drawing {part_name} with {len(connections)} connections")
                 for start_idx, end_idx in connections:
                     start_point = points_2d[start_idx]
                     end_point = points_2d[end_idx]
+                    
+                    # Log first few connections
+                    if start_idx < 3 or end_idx < 3:
+                        logger.info(f"{part_name}: Drawing line from {start_point} to {end_point}")
                     
                     # Draw thicker lines for torso
                     thickness = line_thickness + 1 if part_name == 'torso' else line_thickness
                     cv2.line(frame, start_point, end_point, figure_color, thickness, cv2.LINE_AA)
 
-            # Draw joints
+            # Draw joints with logging
+            logger.info(f"Drawing {len(points_2d)} joints")
             for i, point in enumerate(points_2d):
-                # Larger joints for key points (hips, shoulders, head)
+                # Larger joints for key points
                 is_major_joint = i in [0, 7, 8, 9, 10]
                 joint_size = 6 if is_major_joint else 4
+                
+                # Log first few joints
+                if i < 3:
+                    logger.info(f"Drawing joint {i} at {point} (major: {is_major_joint})")
                 
                 # Draw joint
                 cv2.circle(frame, point, joint_size, figure_color, -1, cv2.LINE_AA)
                 cv2.circle(frame, point, joint_size-1, (153, 77, 0), -1, cv2.LINE_AA)
 
             return frame
-            
+                
         except Exception as e:
             logger.error(f"Error generating wireframe: {str(e)}")
             traceback.print_exc()
