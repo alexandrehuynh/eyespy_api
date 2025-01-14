@@ -34,6 +34,8 @@ import sys
 import torch
 import logging
 import yaml
+import torch.nn as nn
+import logging
 from pathlib import Path
 from typing import Dict, Optional, Union
 from dataclasses import dataclass
@@ -114,92 +116,133 @@ class SimplePositionalEncoding(torch.nn.Module):
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
 
-class SimplifiedDSTformer(torch.nn.Module):
-    """Simplified DSTformer architecture that matches pretrained weights."""
+class SimplePositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        self.pe = nn.Parameter(torch.zeros(1, max_len, d_model))
+        
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+class SimplifiedDSTformer(nn.Module):
     def __init__(self, num_joints=17, in_channels=3):
         super().__init__()
         self.num_joints = num_joints
         self.in_channels = in_channels
         
-        # Initialize the model layers
-        # Input projection: takes flattened joints*channels (17*3=51) to transformer dim (128)
-        self.input_projection = torch.nn.Linear(in_channels * num_joints, 128)
-        
-        # Positional encoding for transformer
-        self.positional_encoding = SimplePositionalEncoding(128)
-        
-        # Transformer encoder layers
-        self.transformer = torch.nn.TransformerEncoder(
-            torch.nn.TransformerEncoderLayer(
-                d_model=128,
-                nhead=8,
-                dim_feedforward=512,
-                dropout=0.1
-            ),
-            num_layers=4
+        # Feature extraction backbone
+        self.backbone = nn.Sequential(
+            # Initial convolution layer
+            nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            # ResNet-style blocks
+            self._make_layer(64, 128, stride=2),
+            self._make_layer(128, 256, stride=2),
+            self._make_layer(256, 512, stride=2),
+            
+            # Global average pooling
+            nn.AdaptiveAvgPool2d((1, 1))
         )
         
-        # Output projection: transforms back from transformer dim (128) to joints*3 (17*3=51)
-        # We multiply by 3 because we want x,y,z coordinates for each joint
-        self.output_projection = torch.nn.Linear(128, num_joints * 3)
+        # Feature dimension after backbone
+        self.feature_dim = 512
         
+        # Initial pose embedding
+        self.pose_embedding = nn.Sequential(
+            nn.Linear(self.feature_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_joints * 3)
+        )
+        
+        # Transformer for temporal modeling
+        transformer_dim = 128
+        self.input_projection = nn.Linear(num_joints * 3, transformer_dim)
+        self.positional_encoding = SimplePositionalEncoding(transformer_dim)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=transformer_dim,
+            nhead=8,
+            dim_feedforward=512,
+            dropout=0.1
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        
+        # Final pose prediction
+        self.output_projection = nn.Linear(transformer_dim, num_joints * 3)
+    
+    def _make_layer(self, in_channels, out_channels, stride=1):
+        """Create a ResNet-style layer"""
+        return nn.Sequential(
+            # Downsample
+            nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            
+            # Regular conv
+            nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
     def forward(self, x):
-        # Input shape: [batch_size, sequence_length, num_joints, channels]
-        # e.g., [1, 1, 17, 3]
-        B, T, J, C = x.shape
+        """
+        Forward pass from video frame to 3D pose
+        Args:
+            x: Input tensor of shape [batch_size, channels, height, width]
+        Returns:
+            Pose predictions of shape [batch_size, sequence_length, num_joints, 3]
+        """
+        batch_size = x.size(0)
         
-        # Reshape to combine batch and sequence, flatten joints and channels
-        # From [1, 1, 17, 3] to [1, 51]
-        x = x.reshape(B * T, J * C)
+        # Extract visual features - [B, C, H, W] -> [B, feature_dim, 1, 1]
+        features = self.backbone(x)
+        
+        # Flatten features - [B, feature_dim, 1, 1] -> [B, feature_dim]
+        features = features.flatten(1)
+        
+        # Initial pose embedding - [B, feature_dim] -> [B, num_joints * 3]
+        initial_pose = self.pose_embedding(features)
+        
+        # Reshape for transformer - [B, num_joints * 3] -> [B, 1, num_joints * 3]
+        pose_sequence = initial_pose.unsqueeze(1)
         
         # Project to transformer dimension
-        # From [1, 51] to [1, 128]
-        x = self.input_projection(x)
-        
-        # Reshape back to include sequence dimension for transformer
-        # From [1, 128] to [1, 1, 128]
-        x = x.reshape(B, T, -1)
+        x = self.input_projection(pose_sequence)  # [B, 1, transformer_dim]
         
         # Add positional encoding
         x = self.positional_encoding(x)
         
-        # Apply transformer - shape remains [1, 1, 128]
-        x = self.transformer(x)
+        # Transformer encoding
+        x = self.transformer(x)  # [B, 1, transformer_dim]
         
-        # Reshape for final projection
-        # From [1, 1, 128] to [1, 128]
-        x = x.reshape(B * T, -1)
+        # Final pose prediction
+        x = self.output_projection(x)  # [B, 1, num_joints * 3]
         
-        # Project back to 3D coordinates
-        # From [1, 128] to [1, 51]
-        x = self.output_projection(x)
-        
-        # Reshape back to [batch, time, joints, 3]
-        # From [1, 51] to [1, 1, 17, 3]
-        x = x.reshape(B, T, J, -1)
+        # Reshape to final output format
+        x = x.view(batch_size, 1, self.num_joints, 3)
         
         return x
 
 def load_motionbert_model(model_base_dir: str, device: torch.device) -> SimplifiedDSTformer:
-    """Load the base MotionBERT model with simplified architecture."""
+    """Load the base MotionBERT model"""
     try:
         model = SimplifiedDSTformer().to(device)
         weights_path = os.path.join(model_base_dir, "motionbert_pretrained.bin")
         
-        # Load state dict
         state_dict = torch.load(weights_path, map_location=device)
-        
-        # Handle potential "model_pos" wrapping
         if "model_pos" in state_dict:
             state_dict = state_dict["model_pos"]
             
         # Load weights with strict=False to allow for architecture differences
         model.load_state_dict(state_dict, strict=False)
-        logger.info("MotionBERT base model loaded successfully")
+        model.eval()  # Set to evaluation mode
         
         return model
     except Exception as e:
-        logger.error(f"Failed to load MotionBERT model: {e}")
+        logging.error(f"Failed to load MotionBERT model: {e}")
         raise
 
 def load_pose_model(model_base_dir: str, device: torch.device) -> SimplifiedDSTformer:
