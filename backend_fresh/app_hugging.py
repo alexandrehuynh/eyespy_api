@@ -546,53 +546,74 @@ class MotionBERTProcessor:
             return None
 
     def generate_wireframe(self, pose_3d):
-        """Generate 3D wireframe visualization using pose data"""
+        """Generate 3D wireframe visualization using pose data in MotionBERT style"""
         if pose_3d is None:
             return np.zeros((720, 1280, 3), dtype=np.uint8)
 
         try:
-            # Create visualization frame with dark background
+            # Create visualization frame with white grid on dark background
             frame = np.ones((720, 1280, 3), dtype=np.uint8) * 32
             
-            # Define H36M skeleton connections
-            h36m_edges = [
-                (0, 1), (1, 2), (2, 3),  # Right leg
-                (0, 4), (4, 5), (5, 6),  # Left leg
-                (0, 7), (7, 8), (8, 9), (9, 10),  # Spine and head
-                (8, 11), (11, 12), (12, 13),  # Right arm
-                (8, 14), (14, 15), (15, 16)  # Left arm
+            # Draw grid (optional)
+            grid_color = (64, 64, 64)  # Light grey
+            grid_spacing = 100
+            for x in range(0, frame.shape[1], grid_spacing):
+                cv2.line(frame, (x, 0), (x, frame.shape[0]), grid_color, 1)
+            for y in range(0, frame.shape[0], grid_spacing):
+                cv2.line(frame, (0, y), (frame.shape[1], y), grid_color, 1)
+            
+            # Define H36M skeleton with clear body segments
+            skeleton_segments = [
+                # Torso
+                [(0, 7), (7, 8), (8, 9), (9, 10)],  # Spine
+                # Right arm
+                [(8, 11), (11, 12), (12, 13)],
+                # Left arm
+                [(8, 14), (14, 15), (15, 16)],
+                # Right leg
+                [(0, 1), (1, 2), (2, 3)],
+                # Left leg
+                [(0, 4), (4, 5), (5, 6)]
             ]
             
             # Project 3D points to 2D
-            focal_length = 1000
-            center = np.array([640, 360])
-            
+            focal_length = 1000  # Adjust for depth perception
+            principal_point = np.array([frame.shape[1]//2, frame.shape[0]//2])
             points_2d = []
-            for point in pose_3d:
-                x = point[0] * focal_length / (point[2] + 1e-8) + center[0]
-                y = point[1] * focal_length / (point[2] + 1e-8) + center[1]
-                points_2d.append((int(x), int(y)))
             
-            # Draw skeleton connections
-            for i, (start_idx, end_idx) in enumerate(h36m_edges):
-                start_point = points_2d[start_idx]
-                end_point = points_2d[end_idx]
+            for point in pose_3d:
+                # Scale points for better visualization
+                x, y, z = point * 100  # Scale factor
                 
-                # Color coding based on body part
-                if i < 3:  # Right leg
-                    color = (255, 0, 0)
-                elif i < 6:  # Left leg
-                    color = (0, 255, 0)
-                elif i < 10:  # Spine and head
-                    color = (0, 0, 255)
-                else:  # Arms
-                    color = (255, 255, 0)
+                # Apply perspective projection
+                x_proj = (x * focal_length / (z + focal_length)) + principal_point[0]
+                y_proj = (y * focal_length / (z + focal_length)) + principal_point[1]
                 
-                cv2.line(frame, start_point, end_point, color, 2, cv2.LINE_AA)
-                
+                points_2d.append((int(x_proj), int(y_proj)))
+            
+            # Draw skeleton
+            line_color = (255, 128, 0)  # Blue color for skeleton
+            for segment_group in skeleton_segments:
+                for start_idx, end_idx in segment_group:
+                    start_point = points_2d[start_idx]
+                    end_point = points_2d[end_idx]
+                    
+                    # Calculate line thickness based on z-coordinate (depth)
+                    z_avg = (pose_3d[start_idx][2] + pose_3d[end_idx][2]) / 2
+                    thickness = max(1, int(4 * (1 - z_avg/np.max(np.abs(pose_3d[:, 2])))))
+                    
+                    # Draw line with anti-aliasing
+                    cv2.line(frame, start_point, end_point, line_color, thickness, cv2.LINE_AA)
+            
             # Draw joints
-            for point in points_2d:
-                cv2.circle(frame, point, 4, (255, 255, 255), -1, cv2.LINE_AA)
+            for i, point in enumerate(points_2d):
+                # Calculate joint size based on depth
+                z_depth = pose_3d[i][2]
+                joint_size = max(2, int(6 * (1 - z_depth/np.max(np.abs(pose_3d[:, 2])))))
+                
+                # Draw joint
+                cv2.circle(frame, point, joint_size, line_color, -1, cv2.LINE_AA)
+                cv2.circle(frame, point, joint_size-1, (128, 64, 0), -1, cv2.LINE_AA)  # Inner circle
             
             return frame
             
