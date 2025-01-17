@@ -959,9 +959,53 @@ def process_video_frames(input_path, mediapipe_path, wireframe_path, mesh_path, 
                         "angles": frame_data.get('angles') if frame_data else None,
                         "velocities": frame_data.get('velocities') if frame_data else None
                     },
-                    "motionbert": motionbert_data if motionbert_data else None
+                    "motionbert": motionbert_data if motionbert_data else None,
+                    "movement_analysis": frame_data.get('movement_analysis') if frame_data else None
+
                 }
                 metadata["frames"].append(frame_metadata)
+
+        logger.info("Processing movement summary...")
+
+        # Calculate the movement summary
+        movement_summary = {
+            "total_frames": frame_count,
+            "detected_movements": {},
+            "average_form_score": 0,
+            "form_issues": set()
+        }
+
+        for frame in metadata["frames"]:
+            if frame.get("movement_analysis"):
+                for movement in frame["movement_analysis"].get("detected_movements", []):
+                    movement_name = movement["name"]
+                    if movement_name not in movement_summary["detected_movements"]:
+                        movement_summary["detected_movements"][movement_name] = {
+                            "count": 0,
+                            "average_form_score": 0,
+                            "phases_detected": set()
+                        }
+                    
+                    movement_summary["detected_movements"][movement_name]["count"] += 1
+                    movement_summary["detected_movements"][movement_name]["average_form_score"] += movement["form_score"]
+                    movement_summary["detected_movements"][movement_name]["phases_detected"].add(movement["phase"])
+                    
+                # Collect unique form issues
+                if "form_issues" in frame["movement_analysis"]:
+                    movement_summary["form_issues"].update(frame["movement_analysis"]["form_issues"])
+
+        # Calculate averages and convert sets to lists for JSON serialization
+        for movement in movement_summary["detected_movements"].values():
+            if movement["count"] > 0:
+                movement["average_form_score"] /= movement["count"]
+            movement["phases_detected"] = list(movement["phases_detected"])
+
+        movement_summary["form_issues"] = list(movement_summary["form_issues"])
+
+        # Add summary to metadata
+        metadata["movement_summary"] = movement_summary
+
+        logger.info(f"Movement summary completed. Detected {len(movement_summary['detected_movements'])} movement types")
 
     except Exception as e:
         logger.error(f"Error processing video: {str(e)}")
