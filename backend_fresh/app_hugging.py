@@ -18,6 +18,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 import traceback
 from motionbert_models import load_motionbert_model, load_pose_model, load_mesh_model
+from movementrecognition import MovementRecognitionSystem
 
 # Add MotionBERT/lib to sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -72,6 +73,9 @@ class PoseProcessor:
         self.motion_history = defaultdict(list)
         self.previous_landmarks = None
         self.device = device
+
+        # initialize the movement recognition system
+        self.movement_recognition = MovementRecognitionSystem()
 
         # Load models
         try:
@@ -315,18 +319,25 @@ class PoseProcessor:
         # Update motion history
         self._update_motion_history(smoothed_landmarks)
 
+        # Create frame_data dictionary
+        frame_data = {
+            'landmarks': smoothed_landmarks, 
+            'angles': angles,
+            'velocities': velocities,
+            'timestamp': datetime.now().timestamp()
+        }
+
+        # Add movement analysis
+        movement_analysis = self.movement_recognition.analyze_frame(frame_data)
+        frame_data['movement_analysis'] = movement_analysis
+
         # Apply visual effects
         frame = self._apply_visual_effects(frame, smoothed_landmarks, angles, velocities)
 
         # Update previous landmarks
         self.previous_landmarks = smoothed_landmarks.copy()
 
-        return frame, {
-            'landmarks': smoothed_landmarks, 
-            'angles': angles,
-            'velocities': velocities,
-            'timestamp': datetime.now().timestamp()
-        }
+        return frame, frame_data
 
     def _process_landmarks(self, landmarks, width, height):
         """Process and smooth landmarks"""
