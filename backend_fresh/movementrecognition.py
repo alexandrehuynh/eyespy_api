@@ -185,7 +185,7 @@ class MovementRecognitionSystem:
             'symmetry_score': 0,
             'form_issues': []
         }
-    
+        
     def _check_phase_match(self, phase: MovementPhase, angles: Dict) -> Dict:
         """Check if current angles match a movement phase"""
         matches = True
@@ -196,7 +196,9 @@ class MovementRecognitionSystem:
             if joint not in angles:
                 continue
                 
-            current_angle = angles[joint]
+            # Extract just the angle value from the tuple
+            current_angle = angles[joint][1]  # Get the second element (angle value)
+            
             if not (min_angle <= current_angle <= max_angle):
                 matches = False
                 break
@@ -216,7 +218,7 @@ class MovementRecognitionSystem:
             'matches': matches,
             'confidence': avg_confidence if matches else 0
         }
-    
+
     def _calculate_form_score(self, current_angles: Dict, target_angles: Dict) -> float:
         """Calculate form score based on how well angles match the target"""
         total_score = 0
@@ -226,7 +228,7 @@ class MovementRecognitionSystem:
             if joint not in current_angles:
                 continue
                 
-            current_angle = current_angles[joint]
+            current_angle = current_angles[joint][1]  # Get the second element (angle value)
             target_center = (min_angle + max_angle) / 2
             max_deviation = (max_angle - min_angle) / 2
             
@@ -237,7 +239,7 @@ class MovementRecognitionSystem:
             num_angles += 1
         
         return total_score / num_angles if num_angles > 0 else 0
-    
+
     def _calculate_symmetry_score(self, angles: Dict) -> float:
         """Calculate bilateral symmetry score"""
         pairs = [
@@ -252,7 +254,10 @@ class MovementRecognitionSystem:
         
         for left, right in pairs:
             if left in angles and right in angles:
-                diff = abs(angles[left] - angles[right])
+                # Extract angle values from tuples
+                left_angle = angles[left][1]
+                right_angle = angles[right][1]
+                diff = abs(left_angle - right_angle)
                 score = max(0, 1 - (diff / 30))  # 30 degrees max difference
                 total_score += score
                 num_pairs += 1
