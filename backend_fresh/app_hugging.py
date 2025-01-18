@@ -415,7 +415,7 @@ class VisualEffects:
     """Handle all visual effects and drawing operations"""
 
     @staticmethod
-    def draw_skeleton(frame, landmarks, connections):
+    def _draw_skeleton(frame, landmarks, connections):
         """Draw the skeleton with custom styling"""
         # Draw connections in white
         for start_idx, end_idx in connections:
@@ -432,7 +432,7 @@ class VisualEffects:
                 cv2.circle(frame, point, 2, (128, 128, 128), -1)  # Inner circle slightly darker
 
     @staticmethod
-    def draw_angles(frame, landmarks, angles):
+    def _draw_angles(frame, landmarks, angles):
         """Draw angle measurements on the frame"""
         for joint_name, (landmark_idx, angle) in angles.items():
             if angle is not None:
@@ -448,7 +448,7 @@ class VisualEffects:
                 )
 
     @staticmethod
-    def draw_pelvis_origin(frame, landmarks, mp_pose):
+    def _draw_pelvis_origin(frame, landmarks, mp_pose):
         """Draw pelvis origin and 3D axes"""
         height, width, _ = frame.shape
 
@@ -481,7 +481,7 @@ class VisualEffects:
         cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
 
     @staticmethod
-    def draw_spine_overlay(frame, landmarks, mp_pose):
+    def _draw_spine_overlay(frame, landmarks, mp_pose):
         """Draw spine overlay with midpoints"""
         # Calculate shoulder and hip midpoints
         left_shoulder = np.array(landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value][:2])
@@ -586,7 +586,7 @@ class MotionBERTProcessor:
             traceback.print_exc()
             return None
 
-    def generate_wireframe(self, pose_3d):
+    def _generate_wireframe(self, pose_3d):
         """Generate 3D wireframe visualization using pose data in MotionBERT style"""
         if pose_3d is None:
             logger.error("pose_3d is None")
@@ -678,7 +678,7 @@ class MotionBERTProcessor:
             traceback.print_exc()
             return np.zeros((720, 1280, 3), dtype=np.uint8)
             
-    def generate_mesh(self, mesh_features):
+    def _generate_mesh(self, mesh_features):
         """Generate 3D mesh visualization using mesh features"""
         if mesh_features is None:
             return np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -696,7 +696,7 @@ class MotionBERTProcessor:
             logger.error(f"Error generating mesh: {str(e)}")
             return np.zeros((720, 1280, 3), dtype=np.uint8)
 
-def setup_paths(file: UploadFile):
+def _setup_paths(file: UploadFile):
     """Setup input, output and metadata paths for video processing"""
     timestamp = datetime.now().strftime("%m%d%Y_%H%M%S")
     input_path = UPLOAD_FOLDER / file.filename
@@ -729,7 +729,7 @@ def setup_paths(file: UploadFile):
 
     return input_path, mediapipe_path, wireframe_path, mesh_path, metadata_path
 
-def save_metadata(metadata_path: Path, metadata: dict):
+def _save_metadata(metadata_path: Path, metadata: dict):
     """Save metadata to JSON file with numpy array handling"""
     try:
         # Convert numpy arrays to lists in metadata
@@ -753,7 +753,7 @@ def save_metadata(metadata_path: Path, metadata: dict):
         logger.error(f"Error saving metadata: {str(e)}")
         raise
 
-def initialize_video_writer(output_path: Path, cap, frame_shape):
+def _initialize_video_writer(output_path: Path, cap, frame_shape):
     """Initialize OpenCV VideoWriter"""
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -772,13 +772,17 @@ def initialize_video_writer(output_path: Path, cap, frame_shape):
 
     return writer
 
-def cleanup_resources(cap, writer):
+def _cleanup_resources(cap, writers: dict):
     """Clean up video capture and writer resources"""
     try:
         if cap is not None:
             cap.release()
-        if writer is not None:
-            writer.release()
+            
+        if writers:
+            for writer in writers.values():
+                if writer is not None:
+                    writer.release()
+                    
         cv2.destroyAllWindows()
         logger.info("Resources cleaned up successfully")
     except Exception as e:
@@ -787,9 +791,12 @@ def cleanup_resources(cap, writer):
 @app.post("/process_video/")
 async def process_video(file: UploadFile = File(...)):
     """Process video and generate three output videos: MediaPipe skeleton, 3D wireframe, and 3D mesh"""
+    cap = None
+    writers = {'mediapipe': None, 'wireframe': None, 'mesh': None}
+
     try:
         # Validate and setup paths for all three videos
-        input_path, mediapipe_path, wireframe_path, mesh_path, metadata_path = setup_paths(file)
+        input_path, mediapipe_path, wireframe_path, mesh_path, metadata_path = _setup_paths(file)
 
         # Initialize processors
         model_base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motionbert", "params")
@@ -800,7 +807,7 @@ async def process_video(file: UploadFile = File(...)):
 
 
         # Process video and generate all three outputs
-        metadata = process_video_frames(
+        metadata = _process_video_frames(
             input_path,
             mediapipe_path,
             wireframe_path,
@@ -811,7 +818,7 @@ async def process_video(file: UploadFile = File(...)):
         )
 
         # Save metadata
-        save_metadata(metadata_path, metadata)
+        _save_metadata(metadata_path, metadata)
 
         return {
             "status": "success",
@@ -842,7 +849,7 @@ async def process_video(file: UploadFile = File(...)):
             detail=f"Video processing failed: {str(e)}"
         )
 
-    finally:
+    finally:        
         # Cleanup temporary files if needed
         try:
             if input_path.exists():
@@ -850,7 +857,7 @@ async def process_video(file: UploadFile = File(...)):
         except Exception as e:
             logger.error(f"Error cleaning up temporary files: {str(e)}")
 
-def process_video_frames(input_path, mediapipe_path, wireframe_path, mesh_path, pose_processor, visual_effects, motionbert_processor):
+def _process_video_frames(input_path, mediapipe_path, wireframe_path, mesh_path, pose_processor, visual_effects, motionbert_processor):
     """Main video processing function for generating three output videos"""
     metadata = {
         "version": "1.0",
@@ -900,22 +907,22 @@ def process_video_frames(input_path, mediapipe_path, wireframe_path, mesh_path, 
                 if frame_data:
                     # Generate MediaPipe visualization
                     mediapipe_frame = processed_frame.copy()
-                    visual_effects.draw_skeleton(
+                    visual_effects._draw_skeleton(
                         mediapipe_frame,
                         frame_data['landmarks'],
                         CUSTOM_POSE_CONNECTIONS
                     )
-                    visual_effects.draw_angles(
+                    visual_effects._draw_angles(
                         mediapipe_frame,
                         frame_data['landmarks'],
                         frame_data['angles']
                     )
-                    visual_effects.draw_pelvis_origin(
+                    visual_effects._draw_pelvis_origin(
                         mediapipe_frame,
                         frame_data['landmarks'],
                         mp_pose
                     )
-                    visual_effects.draw_spine_overlay(
+                    visual_effects._draw_spine_overlay(
                         mediapipe_frame,
                         frame_data['landmarks'],
                         mp_pose
@@ -924,24 +931,24 @@ def process_video_frames(input_path, mediapipe_path, wireframe_path, mesh_path, 
                     # Process with MotionBERT
                     motionbert_data = motionbert_processor.process_frame(frame)
                     if motionbert_data:
-                        wireframe_frame = motionbert_processor.generate_wireframe(
+                        wireframe_frame = motionbert_processor._generate_wireframe(
                             motionbert_data['pose_3d']
                         )
-                        mesh_frame = motionbert_processor.generate_mesh(
+                        mesh_frame = motionbert_processor._generate_mesh(
                             motionbert_data['mesh_features']
                         )
 
                 # Initialize video writers if not already done
                 if writers['mediapipe'] is None:
-                    writers['mediapipe'] = initialize_video_writer(
+                    writers['mediapipe'] = _initialize_video_writer(
                         mediapipe_path, cap, mediapipe_frame.shape
                     )
                 if writers['wireframe'] is None:
-                    writers['wireframe'] = initialize_video_writer(
+                    writers['wireframe'] = _initialize_video_writer(
                         wireframe_path, cap, wireframe_frame.shape
                     )
                 if writers['mesh'] is None:
-                    writers['mesh'] = initialize_video_writer(
+                    writers['mesh'] = _initialize_video_writer(
                         mesh_path, cap, mesh_frame.shape
                     )
 
@@ -1014,13 +1021,7 @@ def process_video_frames(input_path, mediapipe_path, wireframe_path, mesh_path, 
 
     finally:
         # Clean up resources
-        if cap is not None:
-            cap.release()
-        
-        for writer in writers.values():
-            if writer is not None:
-                writer.release()
-        
-        cv2.destroyAllWindows()
+        _cleanup_resources(cap, writers)
+
 
     return metadata
