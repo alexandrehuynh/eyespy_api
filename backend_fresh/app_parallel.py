@@ -6,7 +6,7 @@ import cv2
 import logging
 import mediapipe as mp
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed as futures_completed
 from dataclasses import dataclass
 from datetime import datetime
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -192,7 +192,7 @@ class FrameProcessor:
             }
 
             # Collect results as they complete
-            for future in futures.as_completed(future_to_joint):
+            for future in futures_completed(future_to_joint):
                 joint_name, landmark_idx = future_to_joint[future]
                 try:
                     angle = future.result()
@@ -247,7 +247,7 @@ class FrameProcessor:
                 }
 
                 # Collect results
-                for future in futures.as_completed(future_to_chunk):
+                for future in futures_completed(future_to_chunk):
                     try:
                         chunk_velocities = future.result()
                         velocities.update(chunk_velocities)
