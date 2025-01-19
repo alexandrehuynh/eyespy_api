@@ -1,3 +1,6 @@
+"""
+Enhanced video processing application with improved architecture and performance.
+"""
 import asyncio
 import cv2
 import logging
@@ -139,18 +142,148 @@ class FrameProcessor:
             ])
         return landmarks
 
-    def _calculate_angles(self, landmarks: List[List[float]]) -> Dict[str, float]:
-        """Calculate joint angles from landmarks."""
-        # Implementation of angle calculations
-        pass
+    def _calculate_angles(self, landmarks: List[List[float]]) -> Dict[str, Tuple[int, float]]:
+        """
+        Calculate joint angles from landmarks.
+        Returns a dictionary mapping joint names to tuples of (landmark_index, angle).
+        Thread-safe implementation that processes angles in parallel.
+        """
+        angles = {}
+        
+        def calculate_angle(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> Optional[float]:
+            """Calculate angle between three points using vectorization."""
+            if not all(p is not None for p in [p1, p2, p3]):
+                return None
+                
+            vector1 = p1 - p2
+            vector2 = p3 - p2
+            
+            # Vectorized operations for better performance
+            cosine = np.dot(vector1, vector2) / (np.linalg.norm(vector1) * np.linalg.norm(vector2))
+            angle = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+            return angle
+
+        # Convert landmarks to numpy array for vectorized operations
+        landmark_array = np.array([lm[:3] for lm in landmarks])
+        
+        # Dictionary defining joint angle calculations
+        joint_configs = {
+            'left_elbow': (11, 13, 15),    # Left shoulder, elbow, wrist
+            'right_elbow': (12, 14, 16),   # Right shoulder, elbow, wrist
+            'left_shoulder': (13, 11, 23),  # Left elbow, shoulder, hip
+            'right_shoulder': (14, 12, 24), # Right elbow, shoulder, hip
+            'left_hip': (11, 23, 25),      # Left shoulder, hip, knee
+            'right_hip': (12, 24, 26),     # Right shoulder, hip, knee
+            'left_knee': (23, 25, 27),     # Left hip, knee, ankle
+            'right_knee': (24, 26, 28),    # Right hip, knee, ankle
+        }
+
+        # Process angles in parallel using ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=4) as executor:
+            # Create tasks for each joint angle calculation
+            future_to_joint = {
+                executor.submit(
+                    calculate_angle,
+                    landmark_array[p1],
+                    landmark_array[p2],
+                    landmark_array[p3]
+                ): (joint_name, p2)  # p2 is the vertex point
+                for joint_name, (p1, p2, p3) in joint_configs.items()
+            }
+
+            # Collect results as they complete
+            for future in futures.as_completed(future_to_joint):
+                joint_name, landmark_idx = future_to_joint[future]
+                try:
+                    angle = future.result()
+                    if angle is not None:
+                        angles[joint_name] = (landmark_idx, angle)
+                except Exception as e:
+                    logger.error(f"Error calculating angle for {joint_name}: {str(e)}")
+
+        return angles
 
     def _calculate_velocities(self, landmarks: List[List[float]], frame_number: int) -> Dict[int, float]:
-        """Calculate landmark velocities (only updated every N frames)."""
+        """
+        Calculate landmark velocities (only updated every N frames).
+        Uses numpy for vectorized calculations and parallel processing for efficiency.
+        """
+        # Only calculate velocities periodically to improve performance
         if frame_number % self.config.velocity_update_interval != 0:
             return {}
+
+        velocities = {}
+        
+        try:
+            # Convert current landmarks to numpy array
+            current_landmarks = np.array([lm[:3] for lm in landmarks])
             
-        # Implementation of velocity calculations
-        pass
+            if not hasattr(self, '_previous_landmarks'):
+                self._previous_landmarks = current_landmarks
+                return {}
+
+            # Calculate velocities using vectorized operations
+            with ProcessPoolExecutor(max_workers=4) as executor:
+                # Split landmarks into chunks for parallel processing
+                chunk_size = len(current_landmarks) // 4
+                chunks = [
+                    (
+                        current_landmarks[i:i + chunk_size],
+                        self._previous_landmarks[i:i + chunk_size],
+                        range(i, i + chunk_size)
+                    )
+                    for i in range(0, len(current_landmarks), chunk_size)
+                ]
+
+                # Process chunks in parallel
+                future_to_chunk = {
+                    executor.submit(
+                        self._calculate_velocity_chunk,
+                        current_chunk,
+                        prev_chunk,
+                        indices
+                    ): indices
+                    for current_chunk, prev_chunk, indices in chunks
+                }
+
+                # Collect results
+                for future in futures.as_completed(future_to_chunk):
+                    try:
+                        chunk_velocities = future.result()
+                        velocities.update(chunk_velocities)
+                    except Exception as e:
+                        logger.error(f"Error calculating velocities for chunk: {str(e)}")
+
+            # Update previous landmarks
+            self._previous_landmarks = current_landmarks
+            
+            return velocities
+
+        except Exception as e:
+            logger.error(f"Error calculating velocities: {str(e)}")
+            return {}
+
+    def _calculate_velocity_chunk(
+        self,
+        current_chunk: np.ndarray,
+        prev_chunk: np.ndarray,
+        indices: range
+    ) -> Dict[int, float]:
+        """
+        Calculate velocities for a chunk of landmarks.
+        Helper method for parallel velocity calculations.
+        """
+        chunk_velocities = {}
+        
+        # Vectorized velocity calculation
+        velocities = np.linalg.norm(current_chunk - prev_chunk, axis=1)
+        
+        # Store results
+        for idx, velocity in zip(indices, velocities):
+            if velocity > 0.001:  # Filter out very small movements
+                chunk_velocities[idx] = velocity
+                
+        return chunk_velocities
 
     async def cleanup(self):
         """Clean up resources."""
