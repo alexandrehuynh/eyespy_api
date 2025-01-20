@@ -13,6 +13,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from pathlib import Path
 from queue import Queue
+from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 import torch
 
@@ -313,25 +314,249 @@ class VisualEffectsRenderer:
         self.previous_frame = rendered_frame
         return rendered_frame
 
+    def __init__(self, config: ProcessingConfig):
+        self.config = config
+        self.motion_trails = defaultdict(lambda: deque(maxlen=config.motion_trail_length))
+        self.previous_landmarks = None
+        
+        # Initialize MediaPipe drawing utilities
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_pose = mp.solutions.pose
+        
+        # Define custom pose connections (excluding face landmarks)
+        self.custom_pose_connections = frozenset([
+            (start, end) for start, end in mp.solutions.pose.POSE_CONNECTIONS
+            if 11 <= start < 33 and 11 <= end < 33  # Only include body landmarks (11-32)
+        ])
+        
+        # Color configurations
+        self.colors = {
+            'skeleton': (255, 255, 255),    # White
+            'joint': (128, 128, 128),       # Gray
+            'trail': (0, 255, 255),         # Cyan
+            'velocity': (0, 255, 0),        # Green
+            'angle_text': (0, 255, 0),      # Green
+            'angle_warning': (0, 0, 255)    # Red
+        }
+
     async def _draw_skeleton(self, frame: np.ndarray, processing_result: dict) -> np.ndarray:
-        """Draw skeleton overlay on frame."""
-        # Implementation of skeleton drawing
-        pass
+        """
+        Draw skeleton overlay on frame with custom styling.
+        
+        Args:
+            frame: Input frame
+            processing_result: Dict containing landmarks and other processing data
+            
+        Returns:
+            Frame with skeleton overlay
+        """
+        if not processing_result or 'landmarks' not in processing_result:
+            return frame
+            
+        landmarks = processing_result['landmarks']
+        
+        try:
+            # Create a copy of the frame for drawing
+            overlay = frame.copy()
+            
+            # Draw connections using custom pose connections
+            for start_idx, end_idx in self.custom_pose_connections:
+                if (start_idx < len(landmarks) and end_idx < len(landmarks) and
+                    landmarks[start_idx] is not None and landmarks[end_idx] is not None):
+                    
+                    start_point = tuple(map(int, landmarks[start_idx][:2]))
+                    end_point = tuple(map(int, landmarks[end_idx][:2]))
+                    
+                    # Draw connection line
+                    cv2.line(overlay, start_point, end_point, self.colors['skeleton'], 2, cv2.LINE_AA)
+            
+            # Draw landmarks
+            for i, landmark in enumerate(landmarks):
+                if 11 <= i < 33 and landmark is not None:  # Only body landmarks
+                    point = tuple(map(int, landmark[:2]))
+                    
+                    # Draw outer circle
+                    cv2.circle(overlay, point, 4, self.colors['skeleton'], -1, cv2.LINE_AA)
+                    # Draw inner circle
+                    cv2.circle(overlay, point, 2, self.colors['joint'], -1, cv2.LINE_AA)
+            
+            # Blend overlay with original frame
+            alpha = 0.7
+            frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+            
+            return frame
+            
+        except Exception as e:
+            logger.error(f"Error drawing skeleton: {str(e)}")
+            return frame
 
     async def _draw_motion_trails(self, frame: np.ndarray, processing_result: dict) -> np.ndarray:
-        """Draw motion trails for tracked landmarks."""
-        # Implementation of motion trails
-        pass
+        """
+        Draw motion trails for tracked landmarks with fade effect.
+        
+        Args:
+            frame: Input frame
+            processing_result: Dict containing landmarks and other processing data
+            
+        Returns:
+            Frame with motion trails
+        """
+        if not processing_result or 'landmarks' not in processing_result:
+            return frame
+            
+        landmarks = processing_result['landmarks']
+        
+        try:
+            # Update motion trails
+            for start_idx, end_idx in self.custom_pose_connections:
+                if (start_idx < len(landmarks) and end_idx < len(landmarks) and
+                    landmarks[start_idx] is not None and landmarks[end_idx] is not None):
+                    
+                    start_point = tuple(map(int, landmarks[start_idx][:2]))
+                    end_point = tuple(map(int, landmarks[end_idx][:2]))
+                    
+                    # Store points for trail
+                    self.motion_trails[start_idx].append(start_point)
+                    self.motion_trails[end_idx].append(end_point)
+                    
+                    # Draw trails with fade effect
+                    for trail_id in [start_idx, end_idx]:
+                        points = list(self.motion_trails[trail_id])
+                        if len(points) > 1:
+                            for i in range(1, len(points)):
+                                # Calculate alpha based on position in trail
+                                alpha = i / len(points)
+                                color = tuple(int(c * alpha) for c in self.colors['trail'])
+                                
+                                cv2.line(frame,
+                                        points[i-1],
+                                        points[i],
+                                        color,
+                                        max(1, int(2 * alpha)),  # Line thickness fades too
+                                        cv2.LINE_AA)
+            
+            return frame
+            
+        except Exception as e:
+            logger.error(f"Error drawing motion trails: {str(e)}")
+            return frame
 
     async def _draw_velocity_indicators(self, frame: np.ndarray, processing_result: dict) -> np.ndarray:
-        """Draw velocity indicators (updated every N frames)."""
-        # Implementation of velocity indicators
-        pass
+        """
+        Draw velocity indicators for landmarks (updated periodically).
+        
+        Args:
+            frame: Input frame
+            processing_result: Dict containing landmarks and velocities
+            
+        Returns:
+            Frame with velocity indicators
+        """
+        if (not processing_result or
+            'landmarks' not in processing_result or
+            'velocities' not in processing_result or
+            not processing_result['velocities']):
+            return frame
+            
+        try:
+            landmarks = processing_result['landmarks']
+            velocities = processing_result['velocities']
+            
+            # Draw velocity indicators for landmarks in custom pose connections
+            for start_idx, end_idx in self.custom_pose_connections:
+                for idx in [start_idx, end_idx]:
+                    if idx in velocities and landmarks[idx] is not None:
+                        velocity = velocities[idx]
+                        
+                        # Only draw for significant movement
+                        if velocity > 5:
+                            position = tuple(map(int, landmarks[idx][:2]))
+                            
+                            # Scale circle size with velocity
+                            radius = int(min(velocity * 2, 30))  # Cap maximum size
+                            
+                            # Draw velocity indicator
+                            cv2.circle(frame,
+                                     position,
+                                     radius,
+                                     self.colors['velocity'],
+                                     max(1, int(velocity / 10)),  # Line thickness scales with velocity
+                                     cv2.LINE_AA)
+            
+            return frame
+            
+        except Exception as e:
+            logger.error(f"Error drawing velocity indicators: {str(e)}")
+            return frame
 
     async def _draw_joint_angles(self, frame: np.ndarray, processing_result: dict) -> np.ndarray:
-        """Draw joint angle measurements."""
-        # Implementation of joint angle visualization
-        pass
+        """
+        Draw joint angle measurements with color coding.
+        
+        Args:
+            frame: Input frame
+            processing_result: Dict containing landmarks and angles
+            
+        Returns:
+            Frame with joint angle measurements
+        """
+        if not processing_result or 'angles' not in processing_result:
+            return frame
+            
+        try:
+            landmarks = processing_result['landmarks']
+            angles = processing_result['angles']
+            
+            # Draw angle measurements for each joint
+            for joint_name, (landmark_idx, angle) in angles.items():
+                if angle is not None and landmarks[landmark_idx] is not None:
+                    position = landmarks[landmark_idx]
+                    text_pos = (
+                        int(position[0] + 20),
+                        int(position[1] - 20)
+                    )
+                    
+                    # Determine text color based on angle
+                    color = (self.colors['angle_text'] if angle < 90 
+                            else self.colors['angle_warning'])
+                    
+                    # Format angle text
+                    text = f"{joint_name}: {int(angle)}°"
+                    
+                    # Draw text with background for better visibility
+                    (text_width, text_height), _ = cv2.getTextSize(
+                        text,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        2
+                    )
+                    
+                    # Draw background rectangle
+                    cv2.rectangle(
+                        frame,
+                        (text_pos[0] - 2, text_pos[1] - text_height - 2),
+                        (text_pos[0] + text_width + 2, text_pos[1] + 2),
+                        (0, 0, 0),
+                        -1
+                    )
+                    
+                    # Draw text
+                    cv2.putText(
+                        frame,
+                        text,
+                        text_pos,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        color,
+                        2,
+                        cv2.LINE_AA
+                    )
+            
+            return frame
+            
+        except Exception as e:
+            logger.error(f"Error drawing joint angles: {str(e)}")
+            return frame
 
 class VideoWriter:
     """Handles video writing operations."""
