@@ -204,64 +204,52 @@ class FrameProcessor:
 
         return angles
 
-    def _calculate_velocities(self, landmarks: List[List[float]], frame_number: int) -> Dict[int, float]:
+    def _calculate_movement_velocity(self, landmarks: List[List[float]], frame_number: int) -> Dict[int, float]:
         """
-        Calculate landmark velocities (only updated every N frames).
-        Uses numpy for vectorized calculations and parallel processing for efficiency.
+        Optimized velocity calculation focusing on key joints for movement detection.
+        Returns dict mapping joint indices to their velocities.
         """
-        # Only calculate velocities periodically to improve performance
-        if frame_number % self.config.velocity_update_interval != 0:
-            return {}
 
-        velocities = {}
+        KEY_MOVEMENT_JOINTS = frozenset([
+        11, 12,  # Shoulders (left, right)
+        13, 14,  # Elbows
+        23, 24,  # Hips
+        25, 26,  # Knees
+        27, 28   # Ankles
+        ])
         
         try:
-            # Convert current landmarks to numpy array
-            current_landmarks = np.array([lm[:3] for lm in landmarks])
-            
-            if not hasattr(self, '_previous_landmarks'):
-                self._previous_landmarks = current_landmarks
+            # Convert only key joints to numpy array for efficiency
+            current_positions = np.array([
+                landmarks[i][:3] for i in KEY_MOVEMENT_JOINTS
+                if i < len(landmarks) and landmarks[i] is not None
+            ])
+
+            # Initialize or update previous positions
+            if not hasattr(self, '_prev_positions'):
+                self._prev_positions = current_positions
                 return {}
 
             # Calculate velocities using vectorized operations
-            with ProcessPoolExecutor(max_workers=4) as executor:
-                # Split landmarks into chunks for parallel processing
-                chunk_size = len(current_landmarks) // 4
-                chunks = [
-                    (
-                        current_landmarks[i:i + chunk_size],
-                        self._previous_landmarks[i:i + chunk_size],
-                        range(i, i + chunk_size)
-                    )
-                    for i in range(0, len(current_landmarks), chunk_size)
-                ]
+            velocities = np.linalg.norm(
+                current_positions - self._prev_positions, 
+                axis=1
+            )
 
-                # Process chunks in parallel
-                future_to_chunk = {
-                    executor.submit(
-                        self._calculate_velocity_chunk,
-                        current_chunk,
-                        prev_chunk,
-                        indices
-                    ): indices
-                    for current_chunk, prev_chunk, indices in chunks
-                }
+            # Create result dictionary for joints above threshold
+            result = {
+                joint_idx: vel 
+                for joint_idx, vel in zip(KEY_MOVEMENT_JOINTS, velocities)
+                if vel > 0.001  # Filter out tiny movements
+            }
 
-                # Collect results
-                for future in futures_completed(future_to_chunk):
-                    try:
-                        chunk_velocities = future.result()
-                        velocities.update(chunk_velocities)
-                    except Exception as e:
-                        logger.error(f"Error calculating velocities for chunk: {str(e)}")
+            # Update previous positions for next calculation
+            self._prev_positions = current_positions
 
-            # Update previous landmarks
-            self._previous_landmarks = current_landmarks
-            
-            return velocities
+            return result
 
         except Exception as e:
-            logger.error(f"Error calculating velocities: {str(e)}")
+            logger.error(f"Error calculating movement velocities: {str(e)}")
             return {}
 
     def _calculate_velocity_chunk(
@@ -290,6 +278,90 @@ class FrameProcessor:
         """Clean up resources."""
         self.pose.close()
         self.executor.shutdown()
+
+@dataclass
+class MovementRecognitionConfig:
+    buffer_size: int = 90  # 3 seconds at 30fps
+    confidence_threshold: float = 0.6
+    max_workers: int = 4
+    symmetry_threshold: float = 0.8
+    form_threshold: float = 0.8
+
+class MovementRecognitionProcessor:
+    """
+    Parallel-friendly movement recognition processor integrated with the main pipeline.
+    """
+    def __init__(self, config: MovementRecognitionConfig):
+        self.config = config
+        self.frame_buffer = deque(maxlen=config.buffer_size)
+        self.executor = ProcessPoolExecutor(max_workers=config.max_workers)
+        self.movement_patterns = self._load_movement_patterns()
+        self._initialize_analysis_states()
+
+    async def process_frame(self, frame_data: Dict) -> Dict:
+        """
+        Process a single frame asynchronously using parallel execution for analysis.
+        """
+        # Update buffer
+        self.frame_buffer.append(frame_data)
+        
+        # Run analysis in process pool
+        loop = asyncio.get_event_loop()
+        analysis_result = await loop.run_in_executor(
+            self.executor,
+            self._analyze_movement_parallel,
+            list(self.frame_buffer),
+            frame_data
+        )
+        
+        return analysis_result
+
+    def _analyze_movement_parallel(
+        self, 
+        frame_history: List[Dict],
+        current_frame: Dict
+    ) -> Dict:
+        """
+        CPU-intensive movement analysis running in separate process.
+        """
+        results = {
+            'detected_movements': [],
+            'current_phase': None,
+            'form_issues': [],
+            'metrics': {}
+        }
+
+        # Analyze each movement pattern in parallel
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+            future_to_pattern = {
+                executor.submit(
+                    self._analyze_single_pattern,
+                    pattern,
+                    frame_history,
+                    current_frame
+                ): pattern_name
+                for pattern_name, pattern in self.movement_patterns.items()
+            }
+
+            for future in futures_completed(future_to_pattern):
+                pattern_name = future_to_pattern[future]
+                try:
+                    pattern_results = future.result()
+                    if pattern_results['confidence'] > self.config.confidence_threshold:
+                        results['detected_movements'].append({
+                            'name': pattern_name,
+                            'phase': pattern_results['current_phase'],
+                            'confidence': pattern_results['confidence'],
+                            'form_score': pattern_results['form_score'],
+                            'symmetry_score': pattern_results['symmetry_score']
+                        })
+                        results['form_issues'].extend(pattern_results['form_issues'])
+                except Exception as e:
+                    logger.error(f"Error analyzing pattern {pattern_name}: {str(e)}")
+
+        # Calculate movement metrics
+        results['metrics'] = self._calculate_metrics_parallel(frame_history)
+        return results
 
 class VisualEffectsRenderer:
     """Handles rendering of visual effects and overlays."""
