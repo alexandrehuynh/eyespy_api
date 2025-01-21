@@ -9,6 +9,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed as futures_completed
 from dataclasses import dataclass
 from datetime import datetime
+from mediapipe.python.solutions.pose import POSE_CONNECTIONS
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from pathlib import Path
@@ -23,6 +24,34 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Configuration Constants
+CONFIG = {
+    'MIN_DETECTION_CONFIDENCE': 0.7,
+    'MIN_TRACKING_CONFIDENCE': 0.7,
+    'SMOOTHING_WINDOW': 5,
+    'MOTION_TRAIL_LENGTH': 10,
+    'AXIS_SCALE': 0.2,
+    'AXIS_OPACITY': 0.5,
+    'SKELETON_SAVE_INTERVAL': 30,
+}
+
+# Define custom pose connections (excluding face landmarks)
+CUSTOM_POSE_CONNECTIONS = set([
+    (start, end) for start, end in POSE_CONNECTIONS
+    if 11 <= start < 33 and 11 <= end < 33  # Only include body landmarks (11-32)
+])
+
+# Directory Setup
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_FOLDER = BASE_DIR / "uploads"
+PROCESSED_FOLDER = BASE_DIR / "processed" / "app_parallel"
+MEDIAPIPE_FOLDER = PROCESSED_FOLDER / "mediapipe"
+META_FOLDER = PROCESSED_FOLDER / "meta"
+
+# Ensure folders exist
+for folder in [UPLOAD_FOLDER, PROCESSED_FOLDER, MEDIAPIPE_FOLDER, META_FOLDER]:
+    folder.mkdir(parents=True, exist_ok=True)
 
 @dataclass
 class ProcessingConfig:
@@ -807,6 +836,38 @@ async def process_video(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 def setup_paths(file: UploadFile) -> Tuple[Path, Dict[str, Path]]:
-    """Setup input and output paths."""
-    # Implementation of path setup
-    pass
+    """
+    Setup input and output paths for video processing.
+    
+    Args:
+        file (UploadFile): The uploaded video file
+        
+    Returns:
+        Tuple[Path, Dict[str, Path]]: Tuple containing:
+            - input_path: Path to the uploaded file
+            - output_paths: Dictionary mapping output types to their paths
+    """
+    timestamp = datetime.now().strftime("%m%d%Y_%H%M%S")
+    
+    # Setup input path
+    input_path = UPLOAD_FOLDER / file.filename
+    
+    # Setup output paths
+    output_video_name = f"{timestamp}_{file.filename}"
+    mediapipe_path = MEDIAPIPE_FOLDER / output_video_name
+    metadata_path = META_FOLDER / f"{timestamp}_metadata.json"
+    
+    output_paths = {
+        'mediapipe': mediapipe_path,
+        'metadata': metadata_path
+    }
+    
+    # Save uploaded file
+    try:
+        with open(input_path, "wb") as f:
+            f.write(file.file.read())
+    except Exception as e:
+        logger.error(f"Error saving uploaded file: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+        
+    return input_path, output_paths
