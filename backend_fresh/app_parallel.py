@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 import cv2
 from dataclasses import dataclass
 from datetime import datetime
-from exceptions import MediaPipeError, ResourceError, FrameProcessingError, FrameValidationError
+from exceptions import MediaPipeError, ResourceError, FrameProcessingError, FrameValidationError, VideoWriterError, IOError, ValidationError
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 import json
@@ -794,45 +794,167 @@ class VisualEffectsRenderer:
             return frame
 
 class VideoWriter:
-    """Handles video writing operations."""
+    """Handles video writing operations with improved error handling and resource management."""
     
-    def __init__(self, output_path: Path, frame_shape: Tuple[int, int], fps: int):
-        self.output_path = output_path
-        self.frame_shape = frame_shape
-        self.fps = fps
-        self.writer = None
-        self.executor = ThreadPoolExecutor(max_workers=1)
+    def __init__(self, output_path: Path, frame_shape: Tuple[int, int], fps: int, max_retries: int = 3):
+        """
+        Initialize VideoWriter with validation and error handling.
+        
+        Args:
+            output_path: Path for output video file
+            frame_shape: Tuple of (height, width)
+            fps: Frames per second
+            max_retries: Maximum number of retry attempts for writing operations
+        
+        Raises:
+            ValidationError: If parameters are invalid
+            IOError: If output path is invalid
+        """
+        try:
+            self._validate_parameters(output_path, frame_shape, fps)
+            
+            self.output_path = output_path
+            self.frame_shape = frame_shape
+            self.fps = fps
+            self.max_retries = max_retries
+            self.writer = None
+            self.frames_written = 0
+            self.executor = ThreadPoolExecutor(max_workers=1)
+            self.is_initialized = False
+            
+            # Create output directory if it doesn't exist
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            logger.info(f"VideoWriter initialized for {output_path}")
+        except Exception as e:
+            logger.error(f"Failed to initialize VideoWriter: {str(e)}")
+            raise VideoWriterError(f"Initialization failed: {str(e)}")
+
+    def _validate_parameters(self, output_path: Path, frame_shape: Tuple[int, int], fps: int) -> None:
+        """Validate initialization parameters."""
+        if not isinstance(output_path, Path):
+            raise ValidationError(f"Invalid output_path type: {type(output_path)}")
+            
+        if not isinstance(frame_shape, tuple) or len(frame_shape) != 2:
+            raise ValidationError(f"Invalid frame_shape: {frame_shape}")
+            
+        if frame_shape[0] <= 0 or frame_shape[1] <= 0:
+            raise ValidationError(f"Invalid frame dimensions: {frame_shape}")
+            
+        if fps <= 0:
+            raise ValidationError(f"Invalid fps: {fps}")
+            
+        # Check if output directory is writable
+        if output_path.exists() and not os.access(output_path.parent, os.W_OK):
+            raise IOError(f"Output directory not writable: {output_path.parent}")
 
     async def initialize(self) -> None:
-        """Initialize video writer."""
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        self.writer = cv2.VideoWriter(
-            str(self.output_path),
-            fourcc,
-            self.fps,
-            (self.frame_shape[1], self.frame_shape[0])
-        )
+        """
+        Initialize video writer with retry logic.
+        
+        Raises:
+            VideoWriterError: If initialization fails after retries
+        """
+        retry_count = 0
+        while retry_count < self.max_retries:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                self.writer = cv2.VideoWriter(
+                    str(self.output_path),
+                    fourcc,
+                    self.fps,
+                    (self.frame_shape[1], self.frame_shape[0])
+                )
 
-        if not self.writer.isOpened():
-            raise RuntimeError(f"Failed to initialize video writer for {self.output_path}")
+                if not self.writer.isOpened():
+                    raise VideoWriterError("Failed to open video writer")
+                
+                self.is_initialized = True
+                logger.info(f"VideoWriter initialized successfully for {self.output_path}")
+                return
+                
+            except Exception as e:
+                retry_count += 1
+                logger.warning(f"Initialization attempt {retry_count} failed: {str(e)}")
+                if retry_count >= self.max_retries:
+                    raise VideoWriterError(f"Failed to initialize after {self.max_retries} attempts")
+                await asyncio.sleep(1)  # Wait before retrying
+
+    def _validate_frame(self, frame: np.ndarray) -> None:
+        """Validate frame before writing."""
+        if frame is None:
+            raise ValidationError("Frame is None")
+            
+        if not isinstance(frame, np.ndarray):
+            raise ValidationError(f"Invalid frame type: {type(frame)}")
+            
+        if frame.shape[:2] != self.frame_shape:
+            raise ValidationError(
+                f"Frame shape mismatch. Expected {self.frame_shape}, got {frame.shape[:2]}"
+            )
 
     async def write_frame(self, frame: np.ndarray) -> None:
-        """Write frame to video file asynchronously."""
-        if self.writer is None:
-            await self.initialize()
+        """
+        Write frame to video file asynchronously with retry logic.
+        
+        Args:
+            frame: Frame to write
             
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            self.executor,
-            self.writer.write,
-            frame
-        )
+        Raises:
+            VideoWriterError: If writing fails after retries
+        """
+        if not self.is_initialized:
+            await self.initialize()
+
+        try:
+            self._validate_frame(frame)
+            
+            retry_count = 0
+            while retry_count < self.max_retries:
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        self.executor,
+                        self._write_frame_sync,
+                        frame
+                    )
+                    self.frames_written += 1
+                    return
+                    
+                except Exception as e:
+                    retry_count += 1
+                    logger.warning(f"Frame writing attempt {retry_count} failed: {str(e)}")
+                    if retry_count >= self.max_retries:
+                        raise VideoWriterError(f"Failed to write frame after {self.max_retries} attempts")
+                    await asyncio.sleep(0.1)
+                    
+        except Exception as e:
+            logger.error(f"Error writing frame: {str(e)}")
+            raise VideoWriterError(f"Frame writing error: {str(e)}")
+
+    def _write_frame_sync(self, frame: np.ndarray) -> None:
+        """Synchronous frame writing operation."""
+        if not self.writer.write(frame):
+            raise VideoWriterError("Frame writing failed")
 
     async def cleanup(self) -> None:
-        """Clean up resources."""
-        if self.writer is not None:
-            self.writer.release()
-        self.executor.shutdown()
+        """Clean up resources with error handling."""
+        try:
+            logger.info(f"Starting cleanup for VideoWriter ({self.frames_written} frames written)")
+            
+            if self.writer is not None:
+                self.writer.release()
+                logger.info("Video writer released successfully")
+            
+            if self.executor is not None:
+                self.executor.shutdown(wait=True)
+                logger.info("Thread executor shutdown successfully")
+                
+            logger.info("VideoWriter cleanup completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Error during VideoWriter cleanup: {str(e)}")
+            raise ResourceError(f"Cleanup error: {str(e)}")
 
 class VideoProcessor:
     """Main class coordinating the video processing pipeline."""

@@ -19,3 +19,15 @@ class FrameProcessingError(VideoProcessingError):
 class FrameValidationError(VideoProcessingError):
     """Errors related to frame validation"""
     pass
+
+class VideoWriterError(VideoProcessingError):
+    """Errors related to video writing operations"""
+    pass
+
+class IOError(VideoProcessingError):
+    """Errors related to Input/Output operations"""
+    pass
+
+class ValidationError(VideoProcessingError):
+    """Errors related to validation"""
+    pass
