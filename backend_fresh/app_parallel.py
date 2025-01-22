@@ -2,24 +2,24 @@
 Enhanced video processing application with improved architecture and performance.
 """
 import asyncio
-import cv2
-import os
-import logging
-import mediapipe as mp
-import numpy as np
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed as futures_completed
+import cv2
 from dataclasses import dataclass
 from datetime import datetime
-from mediapipe.python.solutions.pose import POSE_CONNECTIONS
+from exceptions import MediaPipeError, ResourceError, FrameProcessingError, FrameValidationError
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
+import json
+import logging
+import mediapipe as mp
+from mediapipe.python.solutions.pose import POSE_CONNECTIONS
+import numpy as np
+import os
 from pathlib import Path
 from queue import Queue
-from collections import defaultdict, deque
-from typing import Dict, List, Optional, Tuple
 import torch
-import json
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Any
 
 
 # Configure logging
@@ -123,18 +123,10 @@ class QueueManager:
         """Stop queue processing."""
         self.is_processing = False
 
+from exceptions import MediaPipeError, ResourceError, FrameProcessingError, FrameValidationError
+
 class FrameProcessor:
-    async def process_frame(self, frame: np.ndarray, frame_number: int) -> Optional[Dict[str, Any]]:
-        """
-        Process a single frame using MediaPipe pose detection.
-        
-        Args:
-            frame: Input frame to process
-            frame_number: Sequential number of the frame
-            
-        Returns:
-            Optional[Dict[str, Any]]: Processing results or None if processing fails
-        """
+    """Handles raw frame processing using MediaPipe."""
     
     def __init__(self, config: ProcessingConfig):
         """
@@ -142,24 +134,51 @@ class FrameProcessor:
         
         Args:
             config: ProcessingConfig object containing processing parameters
+            
+        Raises:
+            ResourceError: If unable to initialize resources
         """
-        self.config = config
-        self.executor = ProcessPoolExecutor(max_workers=config.max_workers_cpu)
-        # Initialize basic parameters from config
-        self.min_detection_confidence = config.min_detection_confidence
-        self.min_tracking_confidence = config.min_tracking_confidence
+        try:
+            self.config = config
+            self.executor = ProcessPoolExecutor(max_workers=config.max_workers_cpu)
+            self.min_detection_confidence = config.min_detection_confidence
+            self.min_tracking_confidence = config.min_tracking_confidence
+            self.failed_frames_count = 0  # Track consecutive failed detections
+            self.max_failed_frames = 30   # Maximum consecutive failures before warning
+            
+            logger.info("FrameProcessor initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize FrameProcessor: {str(e)}")
+            raise ResourceError(f"Failed to initialize FrameProcessor: {str(e)}")
 
-    @staticmethod
-    def _initialize_pose():
-        """Initialize MediaPipe Pose in worker process."""
-        return mp.solutions.pose.Pose(
-            min_detection_confidence=0.7,  # We'll update these to use config values
-            min_tracking_confidence=0.7
-        )
+    def _validate_frame(self, frame: np.ndarray) -> None:
+        """
+        Validate frame before processing.
+        
+        Args:
+            frame: Input frame to validate
+            
+        Raises:
+            FrameValidationError: If frame is invalid
+        """
+        if frame is None:
+            raise FrameValidationError("Frame is None")
+            
+        if frame.size == 0:
+            raise FrameValidationError("Frame is empty")
+            
+        if not isinstance(frame, np.ndarray):
+            raise FrameValidationError(f"Invalid frame type: {type(frame)}")
+            
+        if len(frame.shape) != 3:
+            raise FrameValidationError(f"Invalid frame shape: {frame.shape}")
 
-    async def process_frame(self, frame: np.ndarray, frame_number: int) -> dict:
+    async def process_frame(self, frame: np.ndarray, frame_number: int) -> Optional[Dict[str, Any]]:
         """Process a single frame using MediaPipe pose detection."""
         try:
+            # Validate frame
+            self._validate_frame(frame)
+            
             # Convert frame to RGB for MediaPipe
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
@@ -168,22 +187,36 @@ class FrameProcessor:
             result = await loop.run_in_executor(
                 self.executor,
                 self._process_frame_cpu,
-                frame_rgb.tobytes(),  # Convert to bytes for pickling
+                frame_rgb.tobytes(),
                 frame.shape,
                 frame_number,
                 self.min_detection_confidence,
                 self.min_tracking_confidence
             )
             
+            # Handle failed detections
+            if result is None:
+                self.failed_frames_count += 1
+                if self.failed_frames_count >= self.max_failed_frames:
+                    logger.warning(f"No pose detected in {self.failed_frames_count} consecutive frames")
+            else:
+                self.failed_frames_count = 0
+            
             return result
             
+        except cv2.error as e:
+            logger.error(f"OpenCV error processing frame {frame_number}: {str(e)}")
+            raise FrameProcessingError(f"OpenCV error: {str(e)}")
+        except FrameValidationError as e:
+            logger.error(f"Frame validation error on frame {frame_number}: {str(e)}")
+            raise
         except Exception as e:
-            logger.error(f"Error processing frame {frame_number}: {str(e)}")
-            return None
+            logger.error(f"Unexpected error processing frame {frame_number}: {str(e)}")
+            raise FrameProcessingError(f"Unexpected error: {str(e)}")
 
     @staticmethod
     def _process_frame_cpu(frame_bytes: bytes, frame_shape: tuple, frame_number: int,
-                          min_detection_confidence: float, min_tracking_confidence: float) -> dict:
+                          min_detection_confidence: float, min_tracking_confidence: float) -> Optional[Dict[str, Any]]:
         """CPU-intensive frame processing (runs in separate process)."""
         try:
             # Reconstruct frame from bytes
@@ -194,28 +227,38 @@ class FrameProcessor:
                 min_detection_confidence=min_detection_confidence,
                 min_tracking_confidence=min_tracking_confidence
             ) as pose:
-                results = pose.process(frame_rgb)
+                try:
+                    results = pose.process(frame_rgb)
+                except Exception as e:
+                    logger.error(f"MediaPipe processing error on frame {frame_number}: {str(e)}")
+                    raise MediaPipeError(f"Processing error: {str(e)}")
                 
                 if not results.pose_landmarks:
+                    logger.debug(f"No pose detected in frame {frame_number}")
                     return None
                     
                 # Extract and process landmarks
-                landmarks = []
-                for landmark in results.pose_landmarks.landmark:
-                    landmarks.append([
-                        landmark.x,
-                        landmark.y,
-                        landmark.z,
-                        landmark.visibility
-                    ])
-                
-                return {
-                    'frame_number': frame_number,
-                    'landmarks': landmarks,
-                    'timestamp': datetime.now().timestamp()
-                }
+                try:
+                    landmarks = []
+                    for landmark in results.pose_landmarks.landmark:
+                        landmarks.append([
+                            landmark.x,
+                            landmark.y,
+                            landmark.z,
+                            landmark.visibility
+                        ])
+                    
+                    return {
+                        'frame_number': frame_number,
+                        'landmarks': landmarks,
+                        'timestamp': datetime.now().timestamp()
+                    }
+                except Exception as e:
+                    logger.error(f"Error extracting landmarks from frame {frame_number}: {str(e)}")
+                    raise FrameProcessingError(f"Landmark extraction error: {str(e)}")
+                    
         except Exception as e:
-            logger.error(f"Error in _process_frame_cpu: {str(e)}")
+            logger.error(f"Error in _process_frame_cpu for frame {frame_number}: {str(e)}")
             return None
 
     def _extract_landmarks(self, pose_landmarks) -> List[List[float]]:
@@ -362,9 +405,16 @@ class FrameProcessor:
         return chunk_velocities
     
     async def cleanup(self):
-        """Clean up resources."""
-        if hasattr(self, 'executor'):
-            await self._shutdown_executor()
+        """Clean up resources safely."""
+        try:
+            if hasattr(self, 'executor'):
+                logger.info("Initiating FrameProcessor cleanup...")
+                self.executor.shutdown(wait=True)
+                logger.info("FrameProcessor cleanup completed successfully")
+        except Exception as e:
+            logger.error(f"Error during FrameProcessor cleanup: {str(e)}")
+            raise ResourceError(f"Cleanup error: {str(e)}")
+        
 
     async def _shutdown_executor(self):
         """Safely shutdown the executor."""
