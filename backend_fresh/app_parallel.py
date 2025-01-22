@@ -18,6 +18,9 @@ from queue import Queue
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 import torch
+import json
+from dataclasses import dataclass
+
 
 # Configure logging
 logging.basicConfig(
@@ -70,6 +73,20 @@ class ProcessingConfig:
     max_workers_cpu: int = 6
     queue_size: int = 100
 
+@dataclass
+class ProcessingPaths:
+    """
+    Container for all paths used in video processing.
+    
+    Attributes:
+        input_path: Path to the uploaded input video
+        video_outputs: Dictionary mapping output type to video output paths
+        metadata_path: Path for the JSON metadata file
+    """
+    input_path: Path
+    video_outputs: Dict[str, Path]
+    metadata_path: Path
+
 class QueueManager:
     """Manages frame processing queues and buffers."""
     
@@ -107,16 +124,38 @@ class QueueManager:
         self.is_processing = False
 
 class FrameProcessor:
-    """Handles raw frame processing using MediaPipe."""
+    async def process_frame(self, frame: np.ndarray, frame_number: int) -> Optional[Dict[str, Any]]:
+        """
+        Process a single frame using MediaPipe pose detection.
+        
+        Args:
+            frame: Input frame to process
+            frame_number: Sequential number of the frame
+            
+        Returns:
+            Optional[Dict[str, Any]]: Processing results or None if processing fails
+        """
     
     def __init__(self, config: ProcessingConfig):
+        """
+        Initialize the FrameProcessor.
+        
+        Args:
+            config: ProcessingConfig object containing processing parameters
+        """
         self.config = config
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            min_detection_confidence=config.min_detection_confidence,
-            min_tracking_confidence=config.min_tracking_confidence
-        )
         self.executor = ProcessPoolExecutor(max_workers=config.max_workers_cpu)
+        # Initialize basic parameters from config
+        self.min_detection_confidence = config.min_detection_confidence
+        self.min_tracking_confidence = config.min_tracking_confidence
+
+    @staticmethod
+    def _initialize_pose():
+        """Initialize MediaPipe Pose in worker process."""
+        return mp.solutions.pose.Pose(
+            min_detection_confidence=0.7,  # We'll update these to use config values
+            min_tracking_confidence=0.7
+        )
 
     async def process_frame(self, frame: np.ndarray, frame_number: int) -> dict:
         """Process a single frame using MediaPipe pose detection."""
@@ -129,8 +168,11 @@ class FrameProcessor:
             result = await loop.run_in_executor(
                 self.executor,
                 self._process_frame_cpu,
-                frame_rgb,
-                frame_number
+                frame_rgb.tobytes(),  # Convert to bytes for pickling
+                frame.shape,
+                frame_number,
+                self.min_detection_confidence,
+                self.min_tracking_confidence
             )
             
             return result
@@ -139,27 +181,42 @@ class FrameProcessor:
             logger.error(f"Error processing frame {frame_number}: {str(e)}")
             return None
 
-    def _process_frame_cpu(self, frame_rgb: np.ndarray, frame_number: int) -> dict:
+    @staticmethod
+    def _process_frame_cpu(frame_bytes: bytes, frame_shape: tuple, frame_number: int,
+                          min_detection_confidence: float, min_tracking_confidence: float) -> dict:
         """CPU-intensive frame processing (runs in separate process)."""
-        results = self.pose.process(frame_rgb)
-        
-        if not results.pose_landmarks:
-            return None
+        try:
+            # Reconstruct frame from bytes
+            frame_rgb = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(frame_shape)
             
-        # Extract and process landmarks
-        landmarks = self._extract_landmarks(results.pose_landmarks)
-        
-        # Calculate additional features
-        angles = self._calculate_angles(landmarks)
-        velocities = self._calculate_velocities(landmarks, frame_number)
-        
-        return {
-            'frame_number': frame_number,
-            'landmarks': landmarks,
-            'angles': angles,
-            'velocities': velocities,
-            'timestamp': datetime.now().timestamp()
-        }
+            # Initialize MediaPipe in the worker process
+            with mp.solutions.pose.Pose(
+                min_detection_confidence=min_detection_confidence,
+                min_tracking_confidence=min_tracking_confidence
+            ) as pose:
+                results = pose.process(frame_rgb)
+                
+                if not results.pose_landmarks:
+                    return None
+                    
+                # Extract and process landmarks
+                landmarks = []
+                for landmark in results.pose_landmarks.landmark:
+                    landmarks.append([
+                        landmark.x,
+                        landmark.y,
+                        landmark.z,
+                        landmark.visibility
+                    ])
+                
+                return {
+                    'frame_number': frame_number,
+                    'landmarks': landmarks,
+                    'timestamp': datetime.now().timestamp()
+                }
+        except Exception as e:
+            logger.error(f"Error in _process_frame_cpu: {str(e)}")
+            return None
 
     def _extract_landmarks(self, pose_landmarks) -> List[List[float]]:
         """Extract landmark coordinates from MediaPipe results."""
@@ -303,11 +360,19 @@ class FrameProcessor:
                 chunk_velocities[idx] = velocity
                 
         return chunk_velocities
-
+    
     async def cleanup(self):
         """Clean up resources."""
-        self.pose.close()
-        self.executor.shutdown()
+        if hasattr(self, 'executor'):
+            await self._shutdown_executor()
+
+    async def _shutdown_executor(self):
+        """Safely shutdown the executor."""
+        try:
+            self.executor.shutdown(wait=True)
+            logger.info("FrameProcessor executor shutdown successfully")
+        except Exception as e:
+            logger.error(f"Error during executor shutdown: {str(e)}")
 
 @dataclass
 class MovementRecognitionConfig:
@@ -394,18 +459,8 @@ class MovementRecognitionProcessor:
         return results
 
 class VisualEffectsRenderer:
-    """
-    Handles rendering of visual effects and overlays for pose visualization.
-    Implements optimized drawing operations for skeleton, motion trails, velocities, and angles.
-    """
-    
     def __init__(self, config: ProcessingConfig):
-        """
-        Initialize the VisualEffectsRenderer with configuration and required components.
-        
-        Args:
-            config: ProcessingConfig object containing rendering parameters
-        """
+        """Initialize the VisualEffectsRenderer with configuration and required components."""
         # Store configuration
         self.config = config
         
@@ -422,9 +477,6 @@ class VisualEffectsRenderer:
             (start, end) for start, end in mp.solutions.pose.POSE_CONNECTIONS
             if 11 <= start < 33 and 11 <= end < 33  # Only include body landmarks (11-32)
         ])
-        
-        # Previous frame for reference
-        self.previous_frame = None
         
         # Color configurations for visual elements
         self.colors = {
@@ -447,6 +499,30 @@ class VisualEffectsRenderer:
             'text_scale': 0.5,
             'text_thickness': 2
         }
+
+    async def render_frame(self, frame: np.ndarray, processing_result: dict) -> np.ndarray:
+        """
+        Render visual effects on processed frame.
+        
+        Args:
+            frame: Input frame
+            processing_result: Dictionary containing landmarks and other processing data
+            
+        Returns:
+            np.ndarray: Frame with rendered visual effects
+        """
+        if processing_result is None:
+            return frame
+
+        rendered_frame = frame.copy()
+        
+        # Apply visual effects
+        rendered_frame = await self._draw_skeleton(rendered_frame, processing_result)
+        rendered_frame = await self._draw_motion_trails(rendered_frame, processing_result)
+        rendered_frame = await self._draw_velocity_indicators(rendered_frame, processing_result)
+        rendered_frame = await self._draw_joint_angles(rendered_frame, processing_result)
+        
+        return rendered_frame
 
     async def _draw_skeleton(self, frame: np.ndarray, processing_result: dict) -> np.ndarray:
         """
@@ -723,27 +799,39 @@ class VideoProcessor:
             'frames': []
         }
 
-    async def process_video(self, input_path: Path, output_paths: Dict[str, Path]) -> dict:
-        """Process video through the pipeline."""
+    async def process_video(self, paths: ProcessingPaths) -> dict:
+        """
+        Process video through the pipeline.
+        
+        Args:
+            paths (ProcessingPaths): Container with all processing paths
+            
+        Returns:
+            dict: Processing metadata
+        """
         try:
             # Initialize video capture
-            cap = cv2.VideoCapture(str(input_path))
+            cap = cv2.VideoCapture(str(paths.input_path))
             if not cap.isOpened():
                 raise RuntimeError("Failed to open input video")
 
-            # Initialize video writers
+            # Initialize video writers only for video outputs
             fps = int(cap.get(cv2.CAP_PROP_FPS))
             frame_shape = (
                 int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                 int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             )
 
-            for name, path in output_paths.items():
+            for name, path in paths.video_outputs.items():
                 self.writers[name] = VideoWriter(path, frame_shape, fps)
                 await self.writers[name].initialize()
 
             # Start processing pipeline
             await self._process_frames(cap)
+
+            # Save metadata
+            with open(paths.metadata_path, 'w') as f:
+                json.dump(self.metadata, f, indent=4)
 
             return self.metadata
 
@@ -818,23 +906,22 @@ app = FastAPI()
 
 @app.post("/process_video/")
 async def process_video(file: UploadFile = File(...)):
-    """Process video endpoint."""
     try:
         # Initialize configuration
         config = ProcessingConfig()
         
         # Setup paths
-        input_path, output_paths = setup_paths(file)
+        paths = setup_paths(file)
         
         # Process video
         processor = VideoProcessor(config)
-        metadata = await processor.process_video(input_path, output_paths)
+        metadata = await processor.process_video(paths)
         
         return {
             "status": "success",
             "videos": {
                 name: FileResponse(path, media_type="video/mp4", filename=path.name)
-                for name, path in output_paths.items()
+                for name, path in paths.video_outputs.items()  # Only video outputs
             },
             "metadata": metadata
         }
@@ -842,6 +929,10 @@ async def process_video(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Error processing video: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Cleanup uploaded file
+        if paths.input_path.exists():
+            paths.input_path.unlink()
 
 def _validate_video_file(file: UploadFile, temp_path: Path) -> bool:
     """
@@ -907,7 +998,7 @@ def _validate_video_file(file: UploadFile, temp_path: Path) -> bool:
     
     return True
 
-def setup_paths(file: UploadFile) -> Tuple[Path, Dict[str, Path]]:
+def setup_paths(file: UploadFile) -> ProcessingPaths:
     """
     Setup input and output paths for video processing.
     
@@ -915,9 +1006,7 @@ def setup_paths(file: UploadFile) -> Tuple[Path, Dict[str, Path]]:
         file (UploadFile): The uploaded video file
         
     Returns:
-        Tuple[Path, Dict[str, Path]]: Tuple containing:
-            - input_path: Path to the uploaded file
-            - output_paths: Dictionary mapping output types to their paths
+        ProcessingPaths: Container with all necessary paths
     """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     
@@ -928,11 +1017,6 @@ def setup_paths(file: UploadFile) -> Tuple[Path, Dict[str, Path]]:
     output_video_name = f"{timestamp}_{file.filename}"
     mediapipe_path = MEDIAPIPE_FOLDER / output_video_name
     metadata_path = META_FOLDER / f"{timestamp}_metadata.json"
-    
-    output_paths = {
-        'mediapipe': mediapipe_path,
-        'metadata': metadata_path
-    }
     
     # Save and validate uploaded file
     try:
@@ -948,5 +1032,9 @@ def setup_paths(file: UploadFile) -> Tuple[Path, Dict[str, Path]]:
             input_path.unlink()
         logger.error(f"Error processing uploaded file: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-        
-    return input_path, output_paths
+    
+    return ProcessingPaths(
+        input_path=input_path,
+        video_outputs={'mediapipe': mediapipe_path},
+        metadata_path=metadata_path
+    )
