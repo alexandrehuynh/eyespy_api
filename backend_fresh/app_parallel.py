@@ -859,8 +859,9 @@ def _validate_video_file(file: UploadFile, temp_path: Path) -> bool:
         )
     
     # Check file size (1GB limit)
+    file_size = os.path.getsize(temp_path)
     max_size = 1024 * 1024 * 1024  # 1GB in bytes
-    if os.path.getsize(temp_path) > max_size:
+    if file_size > max_size:
         raise HTTPException(
             status_code=400,
             detail="File too large. Maximum size is 1GB."
@@ -888,6 +889,13 @@ def _validate_video_file(file: UploadFile, temp_path: Path) -> bool:
             status_code=400,
             detail="Invalid video properties. File may be corrupted."
         )
+
+    # Log successful validation with video properties
+    logger.info(f"Video validated successfully: {file.filename} "
+                f"(Size: {file_size/1024/1024:.1f}MB, "
+                f"Resolution: {width}x{height}, "
+                f"FPS: {fps:.1f}, "
+                f"Frames: {frame_count})")
     
     return True
 
