@@ -835,6 +835,62 @@ async def process_video(file: UploadFile = File(...)):
         logger.error(f"Error processing video: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _validate_video_file(file: UploadFile, temp_path: Path) -> bool:
+    """
+    Validate uploaded video file for size, format, and compatibility.
+    
+    Args:
+        file: UploadFile object
+        temp_path: Path where file is temporarily stored
+        
+    Returns:
+        bool: True if file is valid
+        
+    Raises:
+        HTTPException: If file validation fails
+    """
+    # Check file extension
+    valid_extensions = {'.mp4', '.avi', '.mov', '.mkv'}
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in valid_extensions:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid file type. Supported formats: {', '.join(valid_extensions)}"
+        )
+    
+    # Check file size (1GB limit)
+    max_size = 1024 * 1024 * 1024  # 1GB in bytes
+    if os.path.getsize(temp_path) > max_size:
+        raise HTTPException(
+            status_code=400,
+            detail="File too large. Maximum size is 1GB."
+        )
+    
+    # Check if OpenCV can read the video
+    cap = cv2.VideoCapture(str(temp_path))
+    if not cap.isOpened():
+        cap.release()
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to read video file. File may be corrupted or use an unsupported codec."
+        )
+    
+    # Check basic video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    cap.release()
+    
+    if fps <= 0 or frame_count <= 0 or width <= 0 or height <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid video properties. File may be corrupted."
+        )
+    
+    return True
+
 def setup_paths(file: UploadFile) -> Tuple[Path, Dict[str, Path]]:
     """
     Setup input and output paths for video processing.
@@ -847,7 +903,7 @@ def setup_paths(file: UploadFile) -> Tuple[Path, Dict[str, Path]]:
             - input_path: Path to the uploaded file
             - output_paths: Dictionary mapping output types to their paths
     """
-    timestamp = datetime.now().strftime("%m%d%Y_%H%M%S")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     
     # Setup input path
     input_path = UPLOAD_FOLDER / file.filename
@@ -862,12 +918,19 @@ def setup_paths(file: UploadFile) -> Tuple[Path, Dict[str, Path]]:
         'metadata': metadata_path
     }
     
-    # Save uploaded file
+    # Save and validate uploaded file
     try:
         with open(input_path, "wb") as f:
             f.write(file.file.read())
+        
+        # Validate the saved file
+        _validate_video_file(file, input_path)
+        
     except Exception as e:
-        logger.error(f"Error saving uploaded file: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+        # Clean up the uploaded file if validation fails
+        if input_path.exists():
+            input_path.unlink()
+        logger.error(f"Error processing uploaded file: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
         
     return input_path, output_paths
