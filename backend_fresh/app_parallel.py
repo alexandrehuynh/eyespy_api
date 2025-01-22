@@ -3,6 +3,7 @@ Enhanced video processing application with improved architecture and performance
 """
 import asyncio
 import cv2
+import os
 import logging
 import mediapipe as mp
 import numpy as np
@@ -393,30 +394,22 @@ class MovementRecognitionProcessor:
         return results
 
 class VisualEffectsRenderer:
-    """Handles rendering of visual effects and overlays."""
+    """
+    Handles rendering of visual effects and overlays for pose visualization.
+    Implements optimized drawing operations for skeleton, motion trails, velocities, and angles.
+    """
     
     def __init__(self, config: ProcessingConfig):
-        self.config = config
-        self.previous_frame = None
-
-    async def render_frame(self, frame: np.ndarray, processing_result: dict) -> np.ndarray:
-        """Render visual effects on processed frame."""
-        if processing_result is None:
-            return frame
-
-        rendered_frame = frame.copy()
+        """
+        Initialize the VisualEffectsRenderer with configuration and required components.
         
-        # Apply visual effects
-        rendered_frame = await self._draw_skeleton(rendered_frame, processing_result)
-        rendered_frame = await self._draw_motion_trails(rendered_frame, processing_result)
-        rendered_frame = await self._draw_velocity_indicators(rendered_frame, processing_result)
-        rendered_frame = await self._draw_joint_angles(rendered_frame, processing_result)
-        
-        self.previous_frame = rendered_frame
-        return rendered_frame
-
-    def __init__(self, config: ProcessingConfig):
+        Args:
+            config: ProcessingConfig object containing rendering parameters
+        """
+        # Store configuration
         self.config = config
+        
+        # Initialize motion tracking
         self.motion_trails = defaultdict(lambda: deque(maxlen=config.motion_trail_length))
         self.previous_landmarks = None
         
@@ -430,14 +423,29 @@ class VisualEffectsRenderer:
             if 11 <= start < 33 and 11 <= end < 33  # Only include body landmarks (11-32)
         ])
         
-        # Color configurations
+        # Previous frame for reference
+        self.previous_frame = None
+        
+        # Color configurations for visual elements
         self.colors = {
             'skeleton': (255, 255, 255),    # White
             'joint': (128, 128, 128),       # Gray
             'trail': (0, 255, 255),         # Cyan
             'velocity': (0, 255, 0),        # Green
             'angle_text': (0, 255, 0),      # Green
-            'angle_warning': (0, 0, 255)    # Red
+            'angle_warning': (0, 0, 255),   # Red
+            'pelvis_x': (0, 0, 255),        # Red for X-axis
+            'pelvis_y': (0, 255, 0),        # Green for Y-axis
+            'pelvis_z': (255, 0, 0),        # Blue for Z-axis
+            'spine': (0, 255, 0)            # Green for spine overlay
+        }
+        
+        # Drawing parameters
+        self.drawing_params = {
+            'line_thickness': 2,
+            'circle_radius': 4,
+            'text_scale': 0.5,
+            'text_thickness': 2
         }
 
     async def _draw_skeleton(self, frame: np.ndarray, processing_result: dict) -> np.ndarray:
