@@ -31,3 +31,15 @@ class IOError(VideoProcessingError):
 class ValidationError(VideoProcessingError):
     """Errors related to validation"""
     pass
+
+class RenderingError(VideoProcessingError):
+    """Errors related to visual effects rendering"""
+    pass
+
+class DrawingError(RenderingError):
+    """Errors related to drawing operations"""
+    pass
+
+class EffectProcessingError(RenderingError):
+    """Errors related to effect processing"""
+    pass

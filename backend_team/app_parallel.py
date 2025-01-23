@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 import cv2
 from dataclasses import dataclass
 from datetime import datetime
-from exceptions import MediaPipeError, ResourceError, FrameProcessingError, FrameValidationError, VideoWriterError, IOError, ValidationError
+from exceptions import MediaPipeError, ResourceError, FrameProcessingError, FrameValidationError, VideoWriterError, IOError, ValidationError, RenderingError, DrawingError, EffectProcessingError
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 import json
