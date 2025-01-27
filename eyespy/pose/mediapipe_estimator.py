@@ -5,6 +5,8 @@ from ..models import Keypoint
 from ..config import settings
 import asyncio
 import cv2
+from .validation import PoseValidator
+
 
 class MediaPipeEstimator:
     def __init__(self):
@@ -16,6 +18,8 @@ class MediaPipeEstimator:
             min_tracking_confidence=settings.GLOBAL_CONFIDENCE_THRESHOLD
         )
         self.keypoint_thresholds = settings.KEYPOINT_THRESHOLDS
+        self.validator = PoseValidator()
+
 
     def _apply_threshold(self, keypoint: Keypoint) -> Optional[Keypoint]:
         """Apply confidence thresholding to a single keypoint"""
@@ -56,7 +60,7 @@ class MediaPipeEstimator:
         return len(detected_critical) >= 3  # At least 3 critical points needed
 
     def _process_single_frame(self, frame: np.ndarray) -> Optional[List[Keypoint]]:
-        """Process a single frame with confidence thresholding"""
+        """Process a single frame with confidence thresholding and pose validation"""
         try:
             # Convert BGR to RGB
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -85,9 +89,19 @@ class MediaPipeEstimator:
             # Validate if we have enough keypoints for a valid pose
             if not self._validate_pose(filtered_keypoints):
                 return None
-                
-            return filtered_keypoints
+
+            # Apply additional pose validation
+            is_valid, validation_metrics = self.validator.validate_pose(filtered_keypoints)
             
+            # Store validation metrics for use in response
+            self.frame_metadata = validation_metrics
+            
+            # Return keypoints only if pose is valid
+            if is_valid:
+                return filtered_keypoints
+                
+            return None
+                
         except Exception as e:
             print(f"Error processing frame: {str(e)}")
             return None
