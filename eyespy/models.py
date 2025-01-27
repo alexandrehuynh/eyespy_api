@@ -18,4 +18,5 @@ class PoseEstimationResponse(BaseModel):
     status: ProcessingStatus
     keypoints: Optional[List[Keypoint]] = None
     metadata: Dict[str, any] = {}
+    confidence_metrics: Dict[str, float] = {}  # New field
     error: Optional[str] = None
