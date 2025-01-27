@@ -4,13 +4,13 @@ from pathlib import Path
 import asyncio
 from typing import List, Tuple, Optional
 from .config import settings
-from .video.quality import FrameQualityAssessor, QualityMetrics
+from .video.quality import FrameQualityAssessor, QualityMetrics, AdaptiveFrameQualityAssessor
 
 class VideoProcessor:
     def __init__(self):
         self.temp_dir = Path(settings.TEMP_DIR)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.quality_assessor = FrameQualityAssessor()
+        self.quality_assessor = AdaptiveFrameQualityAssessor()
 
     async def extract_frames(
         self,
@@ -18,8 +18,22 @@ class VideoProcessor:
         target_fps: int = 30,
         max_duration: int = 10
     ) -> Tuple[List[np.ndarray], dict]:
-        """Extract frames with quality assessment"""
         cap = cv2.VideoCapture(str(video_path))
+        
+        # Initial frame sampling for calibration
+        calibration_frames = []
+        while len(calibration_frames) < self.quality_assessor.calibration_size:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            calibration_frames.append(frame)
+        
+        # Calibrate quality thresholds
+        if calibration_frames:
+            self.quality_assessor.calibrate_thresholds(calibration_frames)
+        
+        # Reset video capture
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         
         # Get video properties
         original_fps = int(cap.get(cv2.CAP_PROP_FPS))

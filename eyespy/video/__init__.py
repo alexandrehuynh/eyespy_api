@@ -1,3 +1,3 @@
-from .quality import FrameQualityAssessor, QualityMetrics
+from .quality import QualityMetrics, AdaptiveFrameQualityAssessor
 
-__all__ = ['FrameQualityAssessor', 'QualityMetrics']
+__all__ = [ 'QualityMetrics', 'AdaptiveFrameQualityAssessor']
