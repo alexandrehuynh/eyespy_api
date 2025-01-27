@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 from .models import PoseEstimationResponse, ProcessingStatus
 from .video import VideoProcessor
+from .pose.mediapipe_estimator import MediaPipeEstimator
 import time
 
 app = FastAPI(
@@ -24,7 +25,8 @@ async def root():
 
 @app.post("/api/v1/pose", response_model=PoseEstimationResponse)
 async def process_video(
-    video: UploadFile = File(...)
+    video: UploadFile = File(...),
+    max_frames: int = 30
 ) -> PoseEstimationResponse:
     # Validate video format
     if not any(video.filename.lower().endswith(fmt) 
@@ -35,6 +37,7 @@ async def process_video(
         )
     
     video_processor = VideoProcessor()
+    pose_estimator = MediaPipeEstimator()
     
     try:
         # Save uploaded file
@@ -44,18 +47,47 @@ async def process_video(
                 status_code=500,
                 detail="Failed to save video file"
             )
-            
-        # For now, just return a success response
-        # We'll add actual processing in the next step
+        
+        # Extract frames
+        frames, fps = await video_processor.extract_frames(video_path, max_frames)
+        
+        if not frames:
+            raise HTTPException(
+                status_code=400,
+                detail="No frames could be extracted from video"
+            )
+        
+        # Process middle frame for now (we'll add multi-frame processing later)
+        middle_frame = frames[len(frames)//2]
+        keypoints = pose_estimator.process_frame(middle_frame)
+        
+        # Cleanup
+        await video_processor.cleanup(video_path)
+        
+        if not keypoints:
+            return PoseEstimationResponse(
+                status=ProcessingStatus.COMPLETED,
+                metadata={
+                    "filename": video.filename,
+                    "frames_extracted": len(frames),
+                    "fps": fps,
+                    "message": "No pose detected in frame"
+                }
+            )
+        
         return PoseEstimationResponse(
             status=ProcessingStatus.COMPLETED,
+            keypoints=keypoints,
             metadata={
                 "filename": video.filename,
-                "saved_path": str(video_path)
+                "frames_extracted": len(frames),
+                "fps": fps
             }
         )
         
     except Exception as e:
+        if video_path:
+            await video_processor.cleanup(video_path)
         return PoseEstimationResponse(
             status=ProcessingStatus.FAILED,
             error=str(e)

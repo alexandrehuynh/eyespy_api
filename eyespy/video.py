@@ -33,3 +33,34 @@ class VideoProcessor:
                 file_path.unlink()
         except Exception:
             pass
+
+    async def extract_frames(self, video_path: Path, max_frames: int = 30):
+        """Extract frames from video file"""
+        cap = cv2.VideoCapture(str(video_path))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        
+        # Calculate frame interval to get ~max_frames frames
+        interval = max(1, total_frames // max_frames)
+        
+        frames = []
+        frame_count = 0
+        
+        try:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+                if frame_count % interval == 0:
+                    frames.append(frame)
+                    
+                frame_count += 1
+                
+                # Allow other async operations
+                await asyncio.sleep(0)
+                
+            return frames, fps
+            
+        finally:
+            cap.release()
