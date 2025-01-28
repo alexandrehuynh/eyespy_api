@@ -1,7 +1,9 @@
-from dataclasses import dataclass
-import numpy as np
 import cv2
-from typing import Dict, Tuple, List, Optional
+import numpy as np
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 @dataclass
 class QualityThresholds:
@@ -53,97 +55,74 @@ class AdaptiveFrameQualityAssessor:
     def __init__(self, initial_thresholds: Optional[QualityThresholds] = None):
         self.thresholds = initial_thresholds or QualityThresholds()
         self.calibrated = False
-        self.calibration_size = 30  # Number of frames for calibration
+        self.calibration_size = 30
+        self.executor = ThreadPoolExecutor(max_workers=4)  # For CPU-bound tasks
 
-    def calculate_quality_score(self, metric: float, min_val: float, optimal_val: float, max_val: Optional[float] = None) -> float:
-        """Calculate normalized quality score"""
-        if max_val is not None:
-            if metric < min_val or metric > max_val:
-                return 0.0
-            elif metric < optimal_val:
-                return (metric - min_val) / (optimal_val - min_val)
-            else:
-                return 1.0 - ((metric - optimal_val) / (max_val - optimal_val))
-        else:
-            if metric < min_val:
-                return 0.0
-            elif metric < optimal_val:
-                return (metric - min_val) / (optimal_val - min_val)
-            else:
-                return 1.0
-
-    def calibrate_thresholds(self, frames: List[np.ndarray]) -> QualityThresholds:
-        """Calibrate thresholds based on sample frames"""
-        metrics = []
-        for frame in frames[:self.calibration_size]:
-            quality = self.assess_frame(frame)
-            metrics.append(quality)
-        
-        # Calculate statistics from sample frames
-        brightness_values = [m.details['raw_brightness'] for m in metrics]
-        contrast_values = [m.details['raw_contrast'] for m in metrics]
-        blur_values = [m.details['raw_blur'] for m in metrics]
-        coverage_values = [m.details['raw_coverage'] for m in metrics]
-        
-        # Adjust thresholds based on observed values
-        self.thresholds = QualityThresholds(
-            min_brightness=max(0.1, np.percentile(brightness_values, 10)),
-            max_brightness=min(0.9, np.percentile(brightness_values, 90)),
-            optimal_brightness=np.median(brightness_values),
-            
-            min_contrast=max(0.1, np.percentile(contrast_values, 10)),
-            optimal_contrast=np.median(contrast_values),
-            
-            min_blur_score=max(30, np.percentile(blur_values, 10)),
-            optimal_blur_score=np.median(blur_values),
-            
-            min_coverage=max(0.1, np.percentile(coverage_values, 10)),
-            optimal_coverage=np.median(coverage_values)
-        )
-        
-        self.calibrated = True
-        return self.thresholds
-
-    def assess_frame(self, frame: np.ndarray) -> QualityMetrics:
-        """Assess frame quality with adaptive thresholds"""
-        # Basic measurements
+    async def assess_frame(self, frame: np.ndarray) -> QualityMetrics:
+        """Assess frame quality with parallel measurements"""
+        # Convert to grayscale once for all measurements
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        brightness = np.mean(gray) / 255.0
-        contrast = np.std(gray) / 255.0
+        
+        # Create tasks for parallel execution
+        loop = asyncio.get_event_loop()
+        tasks = [
+            loop.run_in_executor(self.executor, self._measure_brightness, gray),
+            loop.run_in_executor(self.executor, self._measure_contrast, gray),
+            loop.run_in_executor(self.executor, self._measure_blur, gray),
+            loop.run_in_executor(self.executor, self._measure_coverage, gray)
+        ]
+        
+        # Wait for all measurements to complete
+        brightness, contrast, blur, coverage = await asyncio.gather(*tasks)
+        
+        # Calculate overall score (this needs to be sequential as it depends on other metrics)
+        overall_score = self._calculate_overall_score(
+            brightness, contrast, blur, coverage
+        )
+        
+        # Determine validity
+        is_valid = self._check_validity(
+            brightness, contrast, blur, coverage, overall_score
+        )
+        
+        return QualityMetrics(
+            brightness=brightness,
+            contrast=contrast,
+            blur_score=blur,
+            coverage_score=coverage,
+            overall_score=overall_score,
+            is_valid=is_valid,
+            details=self._create_details(
+                brightness, contrast, blur, coverage, overall_score
+            )
+        )
+
+    def _measure_brightness(self, gray: np.ndarray) -> float:
+        """Measure frame brightness"""
+        return np.mean(gray) / 255.0
+
+    def _measure_contrast(self, gray: np.ndarray) -> float:
+        """Measure frame contrast"""
+        return np.std(gray) / 255.0
+
+    def _measure_blur(self, gray: np.ndarray) -> float:
+        """Measure frame blurriness"""
         blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-        normalized_blur = min(1.0, blur_score / self.thresholds.optimal_blur_score)
-        
-        # Calculate coverage
+        return min(1.0, blur_score / self.thresholds.optimal_blur_score)
+
+    def _measure_coverage(self, gray: np.ndarray) -> float:
+        """Measure frame coverage"""
         _, thresh = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
-        coverage = np.count_nonzero(thresh) / thresh.size
-        
-        # Calculate quality scores
-        brightness_score = self.calculate_quality_score(
-            brightness,
-            self.thresholds.min_brightness,
-            self.thresholds.optimal_brightness,
-            self.thresholds.max_brightness
-        )
-        
-        contrast_score = self.calculate_quality_score(
-            contrast,
-            self.thresholds.min_contrast,
-            self.thresholds.optimal_contrast
-        )
-        
-        blur_score = self.calculate_quality_score(
-            normalized_blur,
-            self.thresholds.min_blur_score / self.thresholds.optimal_blur_score,
-            1.0
-        )
-        
-        coverage_score = self.calculate_quality_score(
-            coverage,
-            self.thresholds.min_coverage,
-            self.thresholds.optimal_coverage
-        )
-        
-        # Calculate weighted overall score
+        return np.count_nonzero(thresh) / thresh.size
+
+    def _calculate_overall_score(
+        self,
+        brightness: float,
+        contrast: float,
+        blur: float,
+        coverage: float
+    ) -> float:
+        """Calculate weighted overall quality score"""
         weights = {
             'brightness': 0.25,
             'contrast': 0.25,
@@ -151,31 +130,58 @@ class AdaptiveFrameQualityAssessor:
             'coverage': 0.2
         }
         
-        overall_score = (
-            brightness_score * weights['brightness'] +
-            contrast_score * weights['contrast'] +
-            blur_score * weights['blur'] +
-            coverage_score * weights['coverage']
+        return (
+            brightness * weights['brightness'] +
+            contrast * weights['contrast'] +
+            blur * weights['blur'] +
+            coverage * weights['coverage']
         )
-        
-        is_valid = overall_score >= self.thresholds.min_overall_score
-        
-        return QualityMetrics(
-            brightness=brightness_score,
-            contrast=contrast_score,
-            blur_score=blur_score,
-            coverage_score=coverage_score,
-            overall_score=overall_score,
-            is_valid=is_valid,
-            details={
-                'raw_brightness': brightness,
-                'raw_contrast': contrast,
-                'raw_blur': normalized_blur,
-                'raw_coverage': coverage,
-                'brightness_score': brightness_score,
-                'contrast_score': contrast_score,
-                'blur_score': blur_score,
-                'coverage_score': coverage_score,
-                'threshold_values': self.thresholds.to_dict()
-            }
+
+    def _check_validity(
+        self,
+        brightness: float,
+        contrast: float,
+        blur: float,
+        coverage: float,
+        overall_score: float
+    ) -> bool:
+        """Check if frame meets quality thresholds"""
+        return all([
+            self.thresholds.min_brightness <= brightness <= self.thresholds.max_brightness,
+            contrast >= self.thresholds.min_contrast,
+            blur >= self.thresholds.min_blur_score / self.thresholds.optimal_blur_score,
+            coverage >= self.thresholds.min_coverage,
+            overall_score >= self.thresholds.min_overall_score
+        ])
+
+    def _create_details(
+        self,
+        brightness: float,
+        contrast: float,
+        blur: float,
+        coverage: float,
+        overall_score: float
+    ) -> Dict[str, float]:
+        """Create detailed metrics dictionary"""
+        return {
+            'raw_brightness': brightness,
+            'raw_contrast': contrast,
+            'raw_blur': blur,
+            'raw_coverage': coverage,
+            'brightness_score': brightness,
+            'contrast_score': contrast,
+            'blur_score': blur,
+            'coverage_score': coverage,
+            'overall_score': overall_score,
+            'threshold_values': self.thresholds.to_dict()
+        }
+
+    async def process_batch(self, frames: List[np.ndarray]) -> List[QualityMetrics]:
+        """Process multiple frames in parallel"""
+        return await asyncio.gather(
+            *[self.assess_frame(frame) for frame in frames]
         )
+
+    def __del__(self):
+        """Cleanup executor on deletion"""
+        self.executor.shutdown(wait=False)
