@@ -6,6 +6,7 @@ from ..config import settings
 import asyncio
 import cv2
 from .validation import PoseValidator
+from .confidence import ConfidenceAssessor
 
 
 class MediaPipeEstimator:
@@ -35,13 +36,40 @@ class MediaPipeEstimator:
         return None
 
     def _filter_keypoints(self, keypoints: List[Keypoint]) -> List[Keypoint]:
-        """Filter keypoints based on confidence thresholds"""
-        filtered = []
+        """Filter keypoints based on enhanced confidence assessment"""
+        if not keypoints:
+            return []
+            
+        # Prepare confidence assessor
+        confidence_assessor = ConfidenceAssessor()
+        
+        # Create dictionaries for positions and confidences
+        positions = {kp.name: (kp.x, kp.y) for kp in keypoints}
+        confidences = {kp.name: kp.confidence for kp in keypoints}
+        
+        # Filter keypoints
+        filtered_keypoints = []
         for kp in keypoints:
-            filtered_kp = self._apply_threshold(kp)
-            if filtered_kp:
-                filtered.append(filtered_kp)
-        return filtered
+            adjusted_confidence, is_valid = confidence_assessor.assess_keypoint(
+                kp.name,
+                kp.confidence,
+                (kp.x, kp.y),
+                positions,
+                confidences
+            )
+            
+            if is_valid:
+                # Create new keypoint with adjusted confidence
+                filtered_keypoints.append(
+                    Keypoint(
+                        x=kp.x,
+                        y=kp.y,
+                        confidence=adjusted_confidence,
+                        name=kp.name
+                    )
+                )
+        
+        return filtered_keypoints
 
     def _validate_pose(self, keypoints: List[Keypoint]) -> bool:
         """Validate if enough keypoints are detected for a valid pose"""
