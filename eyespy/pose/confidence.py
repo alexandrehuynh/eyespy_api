@@ -1,7 +1,8 @@
-# app/pose/confidence.py
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 @dataclass
 class ConfidenceThresholds:
@@ -131,50 +132,199 @@ class ThresholdAdjuster:
         return analysis
 
 class AdaptiveConfidenceAssessor:
-    """Enhanced confidence assessor with adaptive thresholds"""
-    
     def __init__(self, thresholds: Optional[ConfidenceThresholds] = None):
         self.thresholds = thresholds or ConfidenceThresholds()
-        self.adjuster = ThresholdAdjuster(self.thresholds)
+        self.executor = ThreadPoolExecutor(max_workers=4)
         
-        # Confidence adjustment factors
-        self.motion_penalty = 0.1       # Reduce confidence for fast motion
-        self.stability_bonus = 0.15     # Boost confidence for stable detections
-        self.context_bonus = 0.2        # Boost for good surrounding detections
+        # Define keypoint relationships for parallel processing
+        self.keypoint_groups = {
+            'core': ['LEFT_SHOULDER', 'RIGHT_SHOULDER', 'LEFT_HIP', 'RIGHT_HIP'],
+            'arms': ['LEFT_ELBOW', 'RIGHT_ELBOW', 'LEFT_WRIST', 'RIGHT_WRIST'],
+            'legs': ['LEFT_KNEE', 'RIGHT_KNEE', 'LEFT_ANKLE', 'RIGHT_ANKLE'],
+            'face': ['NOSE', 'LEFT_EYE', 'RIGHT_EYE', 'LEFT_EAR', 'RIGHT_EAR']
+        }
 
-    def assess_confidence(
+    async def assess_keypoints(
+        self,
+        keypoints: Dict[str, tuple],
+        confidences: Dict[str, float]
+    ) -> Dict[str, float]:
+        """Assess keypoint confidences in parallel"""
+        loop = asyncio.get_event_loop()
+        
+        # Create tasks for parallel anatomical checks
+        tasks = [
+            loop.run_in_executor(
+                self.executor,
+                self._check_group_consistency,
+                group_name,
+                keypoint_list,
+                keypoints,
+                confidences
+            )
+            for group_name, keypoint_list in self.keypoint_groups.items()
+        ]
+        
+        # Add parallel confidence adjustment tasks
+        tasks.extend([
+            loop.run_in_executor(
+                self.executor,
+                self._adjust_confidence,
+                name,
+                pos,
+                conf,
+                keypoints,
+                confidences
+            )
+            for name, (pos, conf) in zip(keypoints.keys(), zip(keypoints.values(), confidences.values()))
+        ])
+        
+        # Wait for all assessments to complete
+        results = await asyncio.gather(*tasks)
+        
+        # Combine group consistency checks and adjusted confidences
+        group_results = results[:len(self.keypoint_groups)]
+        confidence_results = results[len(self.keypoint_groups):]
+        
+        # Merge results
+        final_confidences = {}
+        for name, adjusted_conf in zip(keypoints.keys(), confidence_results):
+            group_factor = self._get_group_factor(name, group_results)
+            final_confidences[name] = min(1.0, adjusted_conf * group_factor)
+            
+        return final_confidences
+
+    def _check_group_consistency(
+        self,
+        group_name: str,
+        keypoint_list: List[str],
+        keypoints: Dict[str, tuple],
+        confidences: Dict[str, float]
+    ) -> Tuple[str, float]:
+        """Check anatomical consistency within a group"""
+        if group_name == 'core':
+            return self._check_core_consistency(keypoints, confidences)
+        elif group_name == 'arms':
+            return self._check_arm_consistency(keypoints, confidences)
+        elif group_name == 'legs':
+            return self._check_leg_consistency(keypoints, confidences)
+        elif group_name == 'face':
+            return self._check_face_consistency(keypoints, confidences)
+        return group_name, 1.0
+
+    def _check_core_consistency(
+        self,
+        keypoints: Dict[str, tuple],
+        confidences: Dict[str, float]
+    ) -> Tuple[str, float]:
+        """Check core body consistency"""
+        if all(k in keypoints for k in ['LEFT_SHOULDER', 'RIGHT_SHOULDER', 'LEFT_HIP', 'RIGHT_HIP']):
+            ls = keypoints['LEFT_SHOULDER']
+            rs = keypoints['RIGHT_SHOULDER']
+            lh = keypoints['LEFT_HIP']
+            rh = keypoints['RIGHT_HIP']
+            
+            # Check if shoulders are above hips
+            if ls[1] < lh[1] and rs[1] < rh[1]:
+                return 'core', 1.0
+        return 'core', 0.8
+
+    def _check_arm_consistency(
+        self,
+        keypoints: Dict[str, tuple],
+        confidences: Dict[str, float]
+    ) -> Tuple[str, float]:
+        """Check arm consistency in parallel"""
+        score = 1.0
+        for side in ['LEFT', 'RIGHT']:
+            if all(f'{side}_{part}' in keypoints for part in ['SHOULDER', 'ELBOW', 'WRIST']):
+                s = keypoints[f'{side}_SHOULDER']
+                e = keypoints[f'{side}_ELBOW']
+                w = keypoints[f'{side}_WRIST']
+                
+                # Check if elbow is between shoulder and wrist
+                if min(s[1], w[1]) <= e[1] <= max(s[1], w[1]):
+                    score *= 1.0
+                else:
+                    score *= 0.8
+        return 'arms', score
+
+    def _check_leg_consistency(
+        self,
+        keypoints: Dict[str, tuple],
+        confidences: Dict[str, float]
+    ) -> Tuple[str, float]:
+        """Check leg consistency in parallel"""
+        score = 1.0
+        for side in ['LEFT', 'RIGHT']:
+            if all(f'{side}_{part}' in keypoints for part in ['HIP', 'KNEE', 'ANKLE']):
+                h = keypoints[f'{side}_HIP']
+                k = keypoints[f'{side}_KNEE']
+                a = keypoints[f'{side}_ANKLE']
+                
+                # Check if knee is between hip and ankle
+                if h[1] < k[1] < a[1]:
+                    score *= 1.0
+                else:
+                    score *= 0.8
+        return 'legs', score
+
+    def _check_face_consistency(
+        self,
+        keypoints: Dict[str, tuple],
+        confidences: Dict[str, float]
+    ) -> Tuple[str, float]:
+        """Check face landmark consistency"""
+        if 'NOSE' in keypoints:
+            nose = keypoints['NOSE']
+            score = 1.0
+            
+            # Check eye positions relative to nose
+            for side in ['LEFT', 'RIGHT']:
+                if f'{side}_EYE' in keypoints:
+                    eye = keypoints[f'{side}_EYE']
+                    if eye[1] - nose[1] > 0.1:  # Eyes should be near nose height
+                        score *= 0.8
+            return 'face', score
+        return 'face', 0.8
+
+    def _adjust_confidence(
         self,
         keypoint_name: str,
-        raw_confidence: float,
-        is_stable: bool = True,
-        has_motion: bool = False,
-        context_score: float = 0.5
+        position: tuple,
+        confidence: float,
+        keypoints: Dict[str, tuple],
+        confidences: Dict[str, float]
     ) -> float:
-        """
-        Assess and adjust confidence based on multiple factors
-        """
+        """Adjust individual keypoint confidence"""
         base_threshold = self.thresholds.get_threshold(keypoint_name)
         
-        # Start with raw confidence
-        adjusted_confidence = raw_confidence
-        
-        # Apply stability bonus
-        if is_stable:
-            adjusted_confidence = min(1.0, adjusted_confidence + self.stability_bonus)
-        
-        # Apply motion penalty
-        if has_motion:
-            adjusted_confidence *= (1.0 - self.motion_penalty)
-        
-        # Apply context bonus if surrounding detections are good
-        if context_score > 0.7:
-            adjusted_confidence = min(1.0, adjusted_confidence + self.context_bonus)
-        
-        # Record for statistical analysis
-        self.adjuster.record_detection(keypoint_name, adjusted_confidence)
-        
-        return adjusted_confidence
+        # Apply position-based adjustments
+        if keypoint_name in self.keypoint_groups['core']:
+            return min(1.0, confidence * 1.2)  # Boost core keypoints
+        elif keypoint_name in self.keypoint_groups['extremities']:
+            return min(1.0, confidence * 0.9)  # Reduce extremity confidence
+            
+        return confidence
 
-    def get_detection_statistics(self) -> Dict[str, Dict[str, float]]:
-        """Get detection statistics for analysis"""
-        return self.adjuster.analyze_detection_rates()
+    def _get_group_factor(self, keypoint_name: str, group_results: List[Tuple[str, float]]) -> float:
+        """Get group consistency factor for a keypoint"""
+        for group_name, score in group_results:
+            if any(group_list for group_list in self.keypoint_groups.values() if keypoint_name in group_list):
+                return score
+        return 1.0
+
+    async def process_batch(
+        self,
+        batch_keypoints: List[Dict[str, tuple]],
+        batch_confidences: List[Dict[str, float]]
+    ) -> List[Dict[str, float]]:
+        """Process multiple keypoint sets in parallel"""
+        return await asyncio.gather(*[
+            self.assess_keypoints(kps, confs)
+            for kps, confs in zip(batch_keypoints, batch_confidences)
+        ])
+
+    def __del__(self):
+        """Cleanup executor"""
+        self.executor.shutdown(wait=False)
