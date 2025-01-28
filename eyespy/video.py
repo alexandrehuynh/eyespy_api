@@ -1,12 +1,37 @@
-# app/video.py
 import cv2
 import numpy as np
-from pathlib import Path
 import asyncio
+from pathlib import Path
 from typing import List, Tuple, Dict, Optional
+from collections import deque
 from .config import settings
 from .video.quality import AdaptiveFrameQualityAssessor, QualityMetrics
 from .video.frame_selector import FrameSelector
+
+class FrameBuffer:
+    """Thread-safe frame buffer for parallel processing"""
+    def __init__(self, maxsize: int = 100):
+        self.frames = deque(maxlen=maxsize)
+        self.lock = asyncio.Lock()
+        self.not_empty = asyncio.Event()
+        self.completed = asyncio.Event()
+
+    async def put(self, frame_data: dict):
+        async with self.lock:
+            self.frames.append(frame_data)
+            self.not_empty.set()
+
+    async def get(self) -> Optional[dict]:
+        if not self.frames and not self.completed.is_set():
+            await self.not_empty.wait()
+        
+        async with self.lock:
+            if self.frames:
+                return self.frames.popleft()
+            return None
+
+    def mark_completed(self):
+        self.completed.set()
 
 class VideoProcessor:
     def __init__(self):
@@ -14,11 +39,8 @@ class VideoProcessor:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.quality_assessor = AdaptiveFrameQualityAssessor()
         self.frame_selector = FrameSelector()
-        
-        # Dynamic parameters for adaptive processing
         self.batch_size = 30
-        self.min_quality_threshold = 0.4
-        self.max_frames_to_process = 1000
+        self.buffer_size = 100
 
     async def extract_frames(
         self,
@@ -26,52 +48,148 @@ class VideoProcessor:
         target_fps: int = 30,
         max_duration: int = 10
     ) -> Tuple[List[np.ndarray], dict]:
-        """Extract frames with both quality assessment and frame selection"""
+        """Extract frames using parallel processing"""
         cap = cv2.VideoCapture(str(video_path))
         
         try:
-            # Phase 1: Initial calibration
+            # Calibration phase
             calibration_data = await self._perform_calibration(cap)
             if not calibration_data:
                 return [], self._create_error_metadata("Calibration failed")
             
-            # Reset video capture after calibration
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            
-            # Get video properties
             metadata = self._get_video_properties(cap)
-            target_frames = min(target_fps * max_duration, metadata["total_frames"])
             
-            # Phase 2: Main frame extraction with quality assessment
-            candidate_frames, quality_data = await self._process_frames(
-                cap,
-                target_frames,
-                metadata["sample_interval"]
-            )
+            # Create shared buffer
+            frame_buffer = FrameBuffer(maxsize=self.buffer_size)
+            result_buffer = FrameBuffer(maxsize=self.buffer_size)
             
-            # Phase 3: Frame selection
-            selected_frames, selected_indices, selection_stats = (
-                self.frame_selector.select_best_frames(
-                    candidate_frames["frames"],
-                    candidate_frames["metrics"],
-                    target_count=target_fps
-                )
-            )
+            # Start parallel processing tasks
+            tasks = [
+                asyncio.create_task(self._frame_reader(cap, frame_buffer, metadata)),
+                asyncio.create_task(self._quality_assessor(frame_buffer, result_buffer)),
+                asyncio.create_task(self._frame_selector(result_buffer))
+            ]
             
-            # Update metadata with both quality and selection information
-            metadata.update(quality_data)
-            metadata.update({
-                "selected_frames": len(selected_frames),
-                "selected_indices": selected_indices,
-                "selection_stats": selection_stats
-            })
+            # Wait for all tasks to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             
+            # Check for exceptions
+            for result in results:
+                if isinstance(result, Exception):
+                    raise result
+            
+            # Process results
+            selected_frames, selection_stats = results[2]  # Results from frame selector
+            
+            metadata.update(selection_stats)
             return selected_frames, metadata
             
         except Exception as e:
             return [], self._create_error_metadata(str(e))
         finally:
             cap.release()
+
+    async def _frame_reader(
+        self,
+        cap: cv2.VideoCapture,
+        frame_buffer: FrameBuffer,
+        metadata: Dict
+    ):
+        """Read frames and add to buffer"""
+        frame_count = 0
+        try:
+            while cap.isOpened():
+                batch_frames = []
+                batch_indices = []
+                
+                # Read batch of frames
+                for _ in range(self.batch_size):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    batch_frames.append(frame)
+                    batch_indices.append(frame_count)
+                    frame_count += 1
+                
+                if not batch_frames:
+                    break
+                
+                # Add batch to buffer
+                await frame_buffer.put({
+                    'frames': batch_frames,
+                    'indices': batch_indices
+                })
+                
+                await asyncio.sleep(0)
+                
+        finally:
+            frame_buffer.mark_completed()
+
+    async def _quality_assessor(
+        self,
+        frame_buffer: FrameBuffer,
+        result_buffer: FrameBuffer
+    ):
+        """Process frames for quality in parallel"""
+        try:
+            while True:
+                batch_data = await frame_buffer.get()
+                if batch_data is None:
+                    break
+                
+                # Process batch in parallel
+                batch_metrics = await self._process_batch(batch_data['frames'])
+                
+                # Add quality results to result buffer
+                await result_buffer.put({
+                    'frames': batch_data['frames'],
+                    'indices': batch_data['indices'],
+                    'metrics': batch_metrics
+                })
+                
+        finally:
+            result_buffer.mark_completed()
+
+    async def _frame_selector(
+        self,
+        result_buffer: FrameBuffer
+    ) -> Tuple[List[np.ndarray], Dict]:
+        """Select frames based on quality and distribution"""
+        frames = []
+        indices = []
+        metrics = []
+        
+        try:
+            while True:
+                result_data = await result_buffer.get()
+                if result_data is None:
+                    break
+                
+                # Add to collection for selection
+                frames.extend(result_data['frames'])
+                indices.extend(result_data['indices'])
+                metrics.extend(result_data['metrics'])
+            
+            # Perform final selection
+            selected_frames, selected_indices, selection_stats = (
+                self.frame_selector.select_best_frames(
+                    frames,
+                    metrics
+                )
+            )
+            
+            stats = {
+                'quality_stats': self._calculate_quality_stats(metrics),
+                'selection_stats': selection_stats,
+                'frame_indices': selected_indices
+            }
+            
+            return selected_frames, stats
+            
+        except Exception as e:
+            print(f"Frame selection error: {str(e)}")
+            return [], {}
 
     async def _perform_calibration(self, cap: cv2.VideoCapture) -> Optional[Dict]:
         """Perform initial calibration and return calibration data"""
