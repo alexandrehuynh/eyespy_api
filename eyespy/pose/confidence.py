@@ -32,41 +32,41 @@ class ConfidenceThresholds:
     def __post_init__(self):
         # Core body points (torso)
         if self.core_points is None:
-            self.core_points = [
+            self.core_points = {
                 "LEFT_SHOULDER", "RIGHT_SHOULDER",
                 "LEFT_HIP", "RIGHT_HIP"
-            ]
+            }
         
         # Primary limb points (upper arms and legs)
         if self.primary_limb_points is None:
-            self.primary_limb_points = [
+            self.primary_limb_points = {
                 "LEFT_ELBOW", "RIGHT_ELBOW",
                 "LEFT_KNEE", "RIGHT_KNEE"
-            ]
+            }
         
         # Secondary limb points (lower arms and legs)
         if self.secondary_limb_points is None:
-            self.secondary_limb_points = [
+            self.secondary_limb_points = {
                 "LEFT_WRIST", "RIGHT_WRIST",
                 "LEFT_ANKLE", "RIGHT_ANKLE"
-            ]
+            }
             
         # Face points
         if self.face_points is None:
-            self.face_points = [
+            self.face_points = {
                 "NOSE", "LEFT_EYE", "RIGHT_EYE",
                 "LEFT_EAR", "RIGHT_EAR", "MOUTH_LEFT", "MOUTH_RIGHT"
-            ]
+            }
         
         # Extremity points (fingers and toes)
         if self.extremity_points is None:
-            self.extremity_points = [
+            self.extremity_points = {
                 "LEFT_PINKY", "RIGHT_PINKY",
                 "LEFT_INDEX", "RIGHT_INDEX",
                 "LEFT_THUMB", "RIGHT_THUMB",
                 "LEFT_HEEL", "RIGHT_HEEL",
                 "LEFT_FOOT_INDEX", "RIGHT_FOOT_INDEX"
-            ]
+            }
 
     def get_threshold(self, keypoint_name: str) -> float:
         """Get confidence threshold for a specific keypoint"""
