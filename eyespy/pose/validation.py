@@ -111,15 +111,11 @@ class PoseValidator:
                 
         return position_validations
 
-    def check_symmetry(
-        self,
-        keypoints: List[Keypoint]
-    ) -> Dict[str, float]:
-        """Check body symmetry ratios"""
+    def check_symmetry(self, keypoints: List[Keypoint]) -> Dict[str, float]:
+        """Vectorized symmetry check"""
         keypoint_dict = {kp.name: kp for kp in keypoints}
         symmetry_scores = {}
         
-        # Define symmetry pairs
         symmetry_pairs = [
             ("LEFT_SHOULDER", "RIGHT_SHOULDER"),
             ("LEFT_HIP", "RIGHT_HIP"),
@@ -127,14 +123,16 @@ class PoseValidator:
             ("LEFT_ANKLE", "RIGHT_ANKLE")
         ]
         
-        for left_name, right_name in symmetry_pairs:
-            if left_name in keypoint_dict and right_name in keypoint_dict:
-                left = keypoint_dict[left_name]
-                right = keypoint_dict[right_name]
+        # Vectorized calculation
+        for left, right in symmetry_pairs:
+            if left in keypoint_dict and right in keypoint_dict:
+                left_x = keypoint_dict[left].x
+                right_x = keypoint_dict[right].x
                 
-                # Calculate horizontal symmetry (should be roughly equal)
-                x_diff = abs(abs(left.x - 0.5) - abs(right.x - 0.5))
-                symmetry_scores[f"{left_name}_{right_name}"] = 1.0 - x_diff
+                # Calculate using numpy vectorization
+                x_diff = np.abs(np.array([left_x, right_x]) - 0.5)
+                symmetry_score = 1.0 - np.mean(np.abs(x_diff[0] - x_diff[1]))
+                symmetry_scores[f"{left}_{right}"] = symmetry_score
                 
         return symmetry_scores
 

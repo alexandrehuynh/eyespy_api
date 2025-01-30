@@ -142,18 +142,14 @@ class MediaPipeEstimator:
         """Process multiple frames with batching and thresholding"""
         all_keypoints = []
         
-        # Process frames in batches
+        # Process frames in parallel batches
         for i in range(0, len(frames), batch_size):
             batch = frames[i:i + batch_size]
-            batch_keypoints = []
-            
-            for frame in batch:
-                keypoints = self._process_single_frame(frame)
-                batch_keypoints.append(keypoints)
-            
-            all_keypoints.extend(batch_keypoints)
-            
-            # Yield control after each batch
+            batch_results = await asyncio.gather(*[
+                self._process_single_frame(frame)
+                for frame in batch
+            ])
+            all_keypoints.extend(batch_results)
             await asyncio.sleep(0)
         
         return all_keypoints

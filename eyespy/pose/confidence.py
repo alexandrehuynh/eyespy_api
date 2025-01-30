@@ -144,6 +144,12 @@ class AdaptiveConfidenceAssessor:
             'face': ['NOSE', 'LEFT_EYE', 'RIGHT_EYE', 'LEFT_EAR', 'RIGHT_EAR']
         }
 
+        # Precompute keypoint-group mapping
+        self.keypoint_group_map = {}
+        for group_name, keypoint_list in self.keypoint_groups.items():
+            for kp in keypoint_list:
+                self.keypoint_group_map[kp] = group_name
+
     async def assess_keypoints(
         self,
         keypoints: Dict[str, tuple],
@@ -308,12 +314,14 @@ class AdaptiveConfidenceAssessor:
         return confidence
 
     def _get_group_factor(self, keypoint_name: str, group_results: List[Tuple[str, float]]) -> float:
-        """Get group consistency factor for a keypoint"""
-        for group_name, score in group_results:
-            if any(group_list for group_list in self.keypoint_groups.values() if keypoint_name in group_list):
-                return score
+        """Optimized group factor lookup"""
+        group_name = self.keypoint_group_map.get(keypoint_name)
+        if group_name:
+            for g_name, score in group_results:
+                if g_name == group_name:
+                    return score
         return 1.0
-
+    
     async def process_batch(
         self,
         batch_keypoints: List[Dict[str, tuple]],

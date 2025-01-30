@@ -176,11 +176,16 @@ class FrameSelector:
             return []
 
         # Sort scores by overall score
-        sorted_scores = sorted(
-            scores,
-            key=lambda x: x.overall_score,
-            reverse=True
-        )
+        sorted_scores = sorted(scores, key=lambda x: x.overall_score, reverse=True)
+        
+        # Precompute ideal spacing once
+        ideal_spacing = total_frames / target_count
+        frame_indices = np.arange(total_frames)
+        position_scores = 1.0 - (frame_indices % ideal_spacing) / ideal_spacing
+        
+        # Add precomputed scores to sorted list
+        for score in sorted_scores:
+            score.temporal_score = position_scores[score.frame_index]
 
         # Calculate window size for temporal distribution
         window_size = total_frames // target_count
