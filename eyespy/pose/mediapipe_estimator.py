@@ -7,6 +7,7 @@ import asyncio
 import cv2
 from .validation import PoseValidator
 from .confidence import ConfidenceAssessor
+from .tracker import ConfidenceTracker
 
 
 class MediaPipeEstimator:
@@ -20,6 +21,7 @@ class MediaPipeEstimator:
         )
         self.keypoint_thresholds = settings.KEYPOINT_THRESHOLDS
         self.validator = PoseValidator()
+        self.confidence_tracker = ConfidenceTracker()
 
 
     def _apply_threshold(self, keypoint: Keypoint) -> Optional[Keypoint]:
@@ -135,21 +137,45 @@ class MediaPipeEstimator:
             return None
 
     async def process_frames(
-        self, 
+        self,
         frames: List[np.ndarray],
         batch_size: int = 5
     ) -> List[Optional[List[Keypoint]]]:
-        """Process multiple frames with batching and thresholding"""
+        """Process frames with confidence tracking"""
         all_keypoints = []
         
-        # Process frames in parallel batches
         for i in range(0, len(frames), batch_size):
             batch = frames[i:i + batch_size]
-            batch_results = await asyncio.gather(*[
-                self._process_single_frame(frame)
-                for frame in batch
-            ])
-            all_keypoints.extend(batch_results)
+            batch_keypoints = []
+            
+            for frame in batch:
+                # Get initial keypoints
+                keypoints = self._process_single_frame(frame)
+                
+                if keypoints:
+                    # Convert to format for tracker
+                    kp_dict = {
+                        kp.name: (kp.x, kp.y, kp.confidence)
+                        for kp in keypoints
+                    }
+                    
+                    # Update tracking
+                    tracked_kp = await self.confidence_tracker.update(kp_dict)
+                    
+                    # Convert back to keypoints
+                    keypoints = [
+                        Keypoint(
+                            name=name,
+                            x=pos[0],
+                            y=pos[1],
+                            confidence=pos[2]
+                        )
+                        for name, pos in tracked_kp.items()
+                    ]
+                
+                batch_keypoints.append(keypoints)
+            
+            all_keypoints.extend(batch_keypoints)
             await asyncio.sleep(0)
         
         return all_keypoints
