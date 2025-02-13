@@ -4,9 +4,9 @@ import asyncio
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from collections import deque
-from .config import settings
-from .video.quality import AdaptiveFrameQualityAssessor, QualityMetrics
-from .video.frame_selector import FrameSelector
+from ..config import settings
+from .quality import AdaptiveFrameQualityAssessor, QualityMetrics
+from .frame_selector import FrameSelector
 
 class FrameBuffer:
     """Thread-safe frame buffer for parallel processing"""

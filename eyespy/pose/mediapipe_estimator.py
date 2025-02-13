@@ -7,7 +7,7 @@ import asyncio
 import cv2
 from concurrent.futures import ThreadPoolExecutor
 from .validation import PoseValidator
-from .confidence import ConfidenceAssessor
+from .confidence import AdaptiveConfidenceAssessor
 from .tracker import ConfidenceTracker
 from .movenet_estimator import MovenetEstimator
 from .fusion import PoseFusion
@@ -176,7 +176,7 @@ class MediaPipeEstimator:
         if not keypoints:
             return []
         
-        confidence_assessor = ConfidenceAssessor()
+        confidence_assessor = AdaptiveConfidenceAssessor()
         positions = {kp.name: (kp.x, kp.y) for kp in keypoints}
         confidences = {kp.name: kp.confidence for kp in keypoints}
         

@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from enum import Enum
 
 class ProcessingStatus(str, Enum):
@@ -17,7 +17,7 @@ class Keypoint(BaseModel):
 class PoseEstimationResponse(BaseModel):
     status: ProcessingStatus
     keypoints: Optional[List[Keypoint]] = None
-    metadata: Dict[str, any] = {}
+    metadata: Dict[str, Any] = {}  
     confidence_metrics: Dict[str, float] = {}
-    validation_metrics: Dict[str, any] = {}  # New field
+    validation_metrics: Dict[str, Any] = {} 
     error: Optional[str] = None
