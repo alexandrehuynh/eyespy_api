@@ -31,11 +31,11 @@ async def process_video(
 ) -> PoseEstimationResponse:
     """
     Process video for pose estimation with multi-frame support
-    - target_fps: Target frames per second to process
-    - max_duration: Maximum duration in seconds to process
     """
     video_path = None
     try:
+        print(f"Received video: {video.filename}, size: {video.size} bytes")
+        
         # Validate video format
         if not any(video.filename.lower().endswith(fmt) 
                   for fmt in settings.SUPPORTED_FORMATS):
@@ -49,6 +49,7 @@ async def process_video(
         pose_estimator = MediaPipeEstimator()
         
         # Save uploaded file
+        print("Saving uploaded file...")
         video_path = await video_processor.save_upload(video)
         if not video_path:
             raise HTTPException(
@@ -56,20 +57,27 @@ async def process_video(
                 detail="Failed to save video file"
             )
         
+        print(f"Video saved to: {video_path}")
+        
         # Extract frames
+        print("Extracting frames...")
         frames, video_metadata = await video_processor.extract_frames(
             video_path,
             target_fps=target_fps,
             max_duration=max_duration
         )
         
+        print(f"Frame extraction complete. Frames extracted: {len(frames)}")
+        print(f"Video metadata: {video_metadata}")
+        
         if not frames:
             raise HTTPException(
                 status_code=400,
-                detail="No frames could be extracted from video"
+                detail=f"No frames could be extracted from video: {video_metadata.get('error', 'Unknown error')}"
             )
         
-        # Process all frames
+        # Process frames
+        print("Processing frames for pose estimation...")
         all_keypoints = await pose_estimator.process_frames(frames)
         
         # Filter out None values and get the most recent valid keypoints
@@ -117,14 +125,13 @@ async def process_video(
         )
         
     except Exception as e:
-        # Ensure cleanup happens even if there's an error
+        print(f"Error processing video: {str(e)}")
         if video_path:
             try:
                 await video_processor.cleanup(video_path)
-            except:
-                pass  # Ignore cleanup errors in error handling
+            except Exception as cleanup_error:
+                print(f"Error during cleanup: {str(cleanup_error)}")
                 
-        # Return error response
         return PoseEstimationResponse(
             status=ProcessingStatus.FAILED,
             error=str(e)

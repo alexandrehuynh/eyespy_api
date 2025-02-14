@@ -31,61 +31,59 @@ class FrameSelector:
         self.batch_size = 50
 
     async def select_best_frames(
-        self,
-        frames: List[np.ndarray],
-        quality_metrics: List[QualityMetrics],
-        target_count: Optional[int] = None
-    ) -> Tuple[List[np.ndarray], List[int], Dict[str, float]]:
-        """Select best frames using parallel processing"""
-        if not frames or not quality_metrics:
-            return [], [], {}
+            self,
+            frames: List[np.ndarray],
+            quality_metrics: List[QualityMetrics],
+            target_count: Optional[int] = None
+        ) -> Tuple[List[np.ndarray], List[int], Dict[str, float]]:
+            """Select best frames using parallel processing"""
+            if not frames or not quality_metrics:
+                return [], [], {}
 
-        # Calculate target number of frames
-        if target_count is None:
-            target_count = len(frames) // self.selection_window
+            if target_count is None:
+                target_count = len(frames) // self.selection_window
 
-        # Split frames into batches for parallel processing
-        batches = self._create_batches(
-            frames, quality_metrics, self.batch_size
-        )
+            # Process batches in parallel
+            loop = asyncio.get_running_loop()
+            batch_tasks = []
+            
+            for i in range(0, len(frames), self.batch_size):
+                batch_frames = frames[i:i + self.batch_size]
+                batch_metrics = quality_metrics[i:i + self.batch_size]
+                
+                task = loop.run_in_executor(
+                    self.executor,
+                    self._score_batch,
+                    batch_frames,
+                    batch_metrics,
+                    i
+                )
+                batch_tasks.append(task)
 
-        # Process batches in parallel
-        loop = asyncio.get_event_loop()
-        batch_tasks = [
-            loop.run_in_executor(
-                self.executor,
-                self._score_batch,
-                batch_frames,
-                batch_metrics,
-                start_idx
+            # Gather all batch results
+            batch_results = await asyncio.gather(*batch_tasks)
+            
+            # Combine all scores
+            all_scores = []
+            for batch_scores in batch_results:
+                all_scores.extend(batch_scores)
+
+            # Select best frames
+            selected_indices = await self._select_distributed_frames(
+                all_scores,
+                target_count,
+                len(frames)
             )
-            for start_idx, (batch_frames, batch_metrics) in enumerate(batches)
-        ]
 
-        # Gather all batch results
-        batch_results = await asyncio.gather(*batch_tasks)
-        
-        # Combine and sort all scores
-        all_scores = []
-        for batch_scores in batch_results:
-            all_scores.extend(batch_scores)
+            # Gather selected frames and statistics
+            selected_frames = [frames[i] for i in selected_indices]
+            selection_stats = await self._calculate_selection_stats(
+                selected_indices,
+                all_scores,
+                quality_metrics
+            )
 
-        # Select best frames using parallel temporal distribution
-        selected_indices = await self._select_distributed_frames(
-            all_scores,
-            target_count,
-            len(frames)
-        )
-
-        # Gather selected frames and their statistics
-        selected_frames = [frames[i] for i in selected_indices]
-        selection_stats = await self._calculate_selection_stats(
-            selected_indices,
-            all_scores,
-            quality_metrics
-        )
-
-        return selected_frames, selected_indices, selection_stats
+            return selected_frames, selected_indices, selection_stats
 
     def _create_batches(
         self,

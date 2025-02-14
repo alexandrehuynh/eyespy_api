@@ -56,7 +56,69 @@ class AdaptiveFrameQualityAssessor:
         self.thresholds = initial_thresholds or QualityThresholds()
         self.calibrated = False
         self.calibration_size = 30
-        self.executor = ThreadPoolExecutor(max_workers=4)  # For CPU-bound tasks
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.calibration_stats = {
+            'brightness': [],
+            'contrast': [],
+            'blur': [],
+            'coverage': []
+        }
+
+    def calibrate_thresholds(self, calibration_frames: List[np.ndarray]) -> bool:
+        """Calibrate quality thresholds based on sample frames"""
+        try:
+            print(f"Starting calibration with {len(calibration_frames)} frames")
+            if not calibration_frames:
+                return False
+
+            # Process calibration frames
+            for frame in calibration_frames:
+                if frame is None:
+                    continue
+
+                # Convert to grayscale
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                # Collect metrics
+                self.calibration_stats['brightness'].append(self._measure_brightness(gray))
+                self.calibration_stats['contrast'].append(self._measure_contrast(gray))
+                self.calibration_stats['blur'].append(cv2.Laplacian(gray, cv2.CV_64F).var())
+                self.calibration_stats['coverage'].append(self._measure_coverage(gray))
+
+            # Calculate adaptive thresholds
+            if all(len(stats) > 0 for stats in self.calibration_stats.values()):
+                # Update brightness thresholds
+                brightness_mean = np.mean(self.calibration_stats['brightness'])
+                self.thresholds.min_brightness = max(0.1, brightness_mean - 0.2)
+                self.thresholds.max_brightness = min(0.9, brightness_mean + 0.2)
+                self.thresholds.optimal_brightness = brightness_mean
+
+                # Update contrast thresholds
+                contrast_mean = np.mean(self.calibration_stats['contrast'])
+                self.thresholds.min_contrast = max(0.1, contrast_mean - 0.15)
+                self.thresholds.optimal_contrast = contrast_mean
+
+                # Update blur thresholds
+                blur_mean = np.mean(self.calibration_stats['blur'])
+                self.thresholds.min_blur_score = max(20, blur_mean * 0.5)
+                self.thresholds.optimal_blur_score = blur_mean
+
+                # Update coverage thresholds
+                coverage_mean = np.mean(self.calibration_stats['coverage'])
+                self.thresholds.min_coverage = max(0.1, coverage_mean - 0.2)
+                self.thresholds.optimal_coverage = coverage_mean
+
+                print("Calibration completed successfully")
+                print(f"Adjusted thresholds: {self.thresholds.to_dict()}")
+                
+                self.calibrated = True
+                return True
+            
+            return False
+
+        except Exception as e:
+            print(f"Error during calibration: {str(e)}")
+            return False
 
     async def assess_frame(self, frame: np.ndarray) -> QualityMetrics:
         """Assess frame quality with parallel measurements"""
@@ -75,7 +137,7 @@ class AdaptiveFrameQualityAssessor:
         # Wait for all measurements to complete
         brightness, contrast, blur, coverage = await asyncio.gather(*tasks)
         
-        # Calculate overall score (this needs to be sequential as it depends on other metrics)
+        # Calculate overall score
         overall_score = self._calculate_overall_score(
             brightness, contrast, blur, coverage
         )
@@ -96,6 +158,7 @@ class AdaptiveFrameQualityAssessor:
                 brightness, contrast, blur, coverage, overall_score
             )
         )
+
 
     def _measure_brightness(self, gray: np.ndarray) -> float:
         """Measure frame brightness"""
