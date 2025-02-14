@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 class MovenetEstimator:
     def __init__(self):
         # Load MoveNet (Thunder is more accurate but slower than Lightning)
-        model_name = "movenet_thunder"
-        self.model = hub.load(f"https://tfhub.dev/google/movenet/{model_name}/4")
+        model_name = "thunder"
+        self.model = hub.load(f"https://tfhub.dev/google/movenet/singlepose/{model_name}/4")
         self.movenet = self.model.signatures['serving_default']
         self.executor = ThreadPoolExecutor(max_workers=4)
         

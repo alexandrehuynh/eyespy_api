@@ -1,3 +1,5 @@
+from fastapi import UploadFile
+import time
 import cv2
 import numpy as np
 import asyncio
@@ -323,3 +325,28 @@ class VideoProcessor:
             "frame_indices": [],
             "quality_metrics": {}
         }
+    
+    async def save_upload(self, video: UploadFile) -> Optional[Path]:
+        """Save uploaded video file"""
+        try:
+            # Create temporary file path
+            file_extension = video.filename.split('.')[-1]
+            temp_file = self.temp_dir / f"temp_{int(time.time())}.{file_extension}"
+            
+            # Save uploaded file
+            with open(temp_file, "wb") as buffer:
+                content = await video.read()
+                buffer.write(content)
+                
+            return temp_file
+        except Exception as e:
+            print(f"Error saving upload: {str(e)}")
+            return None
+
+    async def cleanup(self, file_path: Path):
+        """Clean up temporary files"""
+        try:
+            if file_path and file_path.exists():
+                file_path.unlink()
+        except Exception as e:
+            print(f"Error during cleanup: {str(e)}")
