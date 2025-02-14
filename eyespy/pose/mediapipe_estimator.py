@@ -135,66 +135,65 @@ class MediaPipeEstimator:
         
         return processed_keypoints
 
-    def _process_single_frame(self, frame: np.ndarray) -> Optional[List[Keypoint]]:
-        """Process a single frame with MediaPipe"""
-        try:
-            # Convert BGR to RGB
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Process the frame
-            results = self.pose.process(rgb_frame)
-            
-            if not results.pose_landmarks:
+    async def _process_single_frame(self, frame: np.ndarray) -> Optional[List[Keypoint]]:
+            """Process a single frame with MediaPipe"""
+            try:
+                # Convert BGR to RGB
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Process the frame
+                results = self.pose.process(rgb_frame)
+                
+                if not results.pose_landmarks:
+                    return None
+                
+                # Convert landmarks to keypoints
+                keypoints = [
+                    Keypoint(
+                        x=landmark.x,
+                        y=landmark.y,
+                        confidence=landmark.visibility,
+                        name=self.mp_pose.PoseLandmark(idx).name
+                    )
+                    for idx, landmark in enumerate(results.pose_landmarks.landmark)
+                ]
+                
+                # Apply confidence thresholding
+                filtered_keypoints = await self._filter_keypoints(keypoints)
+                
+                # Basic validation
+                if not filtered_keypoints or not self._validate_pose(filtered_keypoints):
+                    return None
+                
+                return filtered_keypoints
+                
+            except Exception as e:
+                print(f"Error processing frame: {str(e)}")
                 return None
-            
-            # Convert landmarks to keypoints
-            keypoints = [
-                Keypoint(
-                    x=landmark.x,
-                    y=landmark.y,
-                    confidence=landmark.visibility,
-                    name=self.mp_pose.PoseLandmark(idx).name
-                )
-                for idx, landmark in enumerate(results.pose_landmarks.landmark)
-            ]
-            
-            # Apply confidence thresholding
-            filtered_keypoints = self._filter_keypoints(keypoints)
-            
-            # Basic validation
-            if not self._validate_pose(filtered_keypoints):
-                return None
-            
-            return filtered_keypoints
-            
-        except Exception as e:
-            print(f"Error processing frame: {str(e)}")
-            return None
 
-    def _filter_keypoints(self, keypoints: List[Keypoint]) -> List[Keypoint]:
+    async def _filter_keypoints(self, keypoints: List[Keypoint]) -> List[Keypoint]:
         """Filter keypoints with enhanced confidence assessment"""
         if not keypoints:
             return []
         
         confidence_assessor = AdaptiveConfidenceAssessor()
         positions = {kp.name: (kp.x, kp.y) for kp in keypoints}
-        confidences = {kp.name: kp.confidence for kp in keypoints}
+        confidences = {kp.name: kp.confidence for kp in keypoints}    
+
+        adjusted_confidences = await confidence_assessor.assess_keypoints(
+            positions,
+            confidences
+        )
         
         return [
             Keypoint(
                 x=kp.x,
                 y=kp.y,
-                confidence=conf,
+                confidence=adjusted_confidences.get(kp.name, kp.confidence),
                 name=kp.name
             )
             for kp in keypoints
-            if (conf := confidence_assessor.assess_keypoint(
-                kp.name,
-                kp.confidence,
-                (kp.x, kp.y),
-                positions,
-                confidences
-            )[0]) > 0
+            if adjusted_confidences.get(kp.name, 0) > 0
         ]
 
     def _validate_pose(self, keypoints: List[Keypoint]) -> bool:

@@ -14,10 +14,17 @@ class Keypoint(BaseModel):
     confidence: float
     name: str
 
+class ConfidenceMetrics(BaseModel):
+    average_confidence: float
+    keypoints: Dict[str, float]
+
 class PoseEstimationResponse(BaseModel):
     status: ProcessingStatus
     keypoints: Optional[List[Keypoint]] = None
     metadata: Dict[str, Any] = {}  
-    confidence_metrics: Dict[str, float] = {}
+    confidence_metrics: ConfidenceMetrics = ConfidenceMetrics(
+        average_confidence=0.0,
+        keypoints={}
+    )
     validation_metrics: Dict[str, Any] = {} 
     error: Optional[str] = None
