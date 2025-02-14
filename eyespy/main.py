@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
-from .models import PoseEstimationResponse, ProcessingStatus
+from .models import PoseEstimationResponse, ProcessingStatus, ConfidenceMetrics, Keypoint
 from .video import VideoProcessor
 from .pose.mediapipe_estimator import MediaPipeEstimator
 import time
@@ -100,16 +100,17 @@ async def process_video(
         
         # Calculate confidence metrics
         confidence_by_part = {}
-        for kp in latest_keypoints:
-            confidence_by_part[kp.name] = kp.confidence
+        avg_confidence = 0.0
         
-        # Calculate average confidence
-        avg_confidence = sum(kp.confidence for kp in latest_keypoints) / len(latest_keypoints)
+        if latest_keypoints:
+            for kp in latest_keypoints:
+                confidence_by_part[kp.name] = kp.confidence
+            avg_confidence = sum(kp.confidence for kp in latest_keypoints) / len(latest_keypoints)
         
-        confidence_metrics = {
-            "average_confidence": avg_confidence,
-            "keypoints": confidence_by_part
-        }
+        confidence_metrics = ConfidenceMetrics(
+            average_confidence=avg_confidence,
+            keypoints=confidence_by_part
+        )
         
         # Return successful response with keypoints and metrics
         return PoseEstimationResponse(

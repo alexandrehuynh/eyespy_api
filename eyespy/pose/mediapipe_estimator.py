@@ -78,15 +78,8 @@ class MediaPipeEstimator:
         batch: List[np.ndarray]
     ) -> List[Optional[List[Keypoint]]]:
         """Process a batch of frames with MediaPipe in parallel"""
-        loop = asyncio.get_event_loop()
-        tasks = [
-            loop.run_in_executor(
-                self.executor,
-                self._process_single_frame,
-                frame
-            )
-            for frame in batch
-        ]
+        # Process frames in parallel using asyncio.gather
+        tasks = [self._process_single_frame(frame) for frame in batch]
         return await asyncio.gather(*tasks)
 
     async def _process_batch_results(
@@ -136,40 +129,44 @@ class MediaPipeEstimator:
         return processed_keypoints
 
     async def _process_single_frame(self, frame: np.ndarray) -> Optional[List[Keypoint]]:
-            """Process a single frame with MediaPipe"""
-            try:
-                # Convert BGR to RGB
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Process the frame
-                results = self.pose.process(rgb_frame)
-                
-                if not results.pose_landmarks:
-                    return None
-                
-                # Convert landmarks to keypoints
-                keypoints = [
-                    Keypoint(
-                        x=landmark.x,
-                        y=landmark.y,
-                        confidence=landmark.visibility,
-                        name=self.mp_pose.PoseLandmark(idx).name
-                    )
-                    for idx, landmark in enumerate(results.pose_landmarks.landmark)
-                ]
-                
-                # Apply confidence thresholding
-                filtered_keypoints = await self._filter_keypoints(keypoints)
-                
-                # Basic validation
-                if not filtered_keypoints or not self._validate_pose(filtered_keypoints):
-                    return None
-                
-                return filtered_keypoints
-                
-            except Exception as e:
-                print(f"Error processing frame: {str(e)}")
+        """Process a single frame with MediaPipe"""
+        try:
+            # Convert BGR to RGB
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Process the frame with MediaPipe
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(
+                self.executor,
+                lambda: self.pose.process(rgb_frame)
+            )
+            
+            if not results.pose_landmarks:
                 return None
+            
+            # Convert landmarks to keypoints
+            keypoints = [
+                Keypoint(
+                    x=landmark.x,
+                    y=landmark.y,
+                    confidence=landmark.visibility,
+                    name=self.mp_pose.PoseLandmark(idx).name
+                )
+                for idx, landmark in enumerate(results.pose_landmarks.landmark)
+            ]
+            
+            # Apply confidence thresholding
+            filtered_keypoints = await self._filter_keypoints(keypoints)
+            
+            # Basic validation
+            if not self._validate_pose(filtered_keypoints):
+                return None
+            
+            return filtered_keypoints
+            
+        except Exception as e:
+            print(f"Error processing frame: {str(e)}")
+            return None
 
     async def _filter_keypoints(self, keypoints: List[Keypoint]) -> List[Keypoint]:
         """Filter keypoints with enhanced confidence assessment"""
@@ -178,8 +175,8 @@ class MediaPipeEstimator:
         
         confidence_assessor = AdaptiveConfidenceAssessor()
         positions = {kp.name: (kp.x, kp.y) for kp in keypoints}
-        confidences = {kp.name: kp.confidence for kp in keypoints}    
-
+        confidences = {kp.name: kp.confidence for kp in keypoints}
+        
         adjusted_confidences = await confidence_assessor.assess_keypoints(
             positions,
             confidences
