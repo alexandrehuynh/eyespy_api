@@ -59,31 +59,43 @@ async def process_video(
         
         print(f"Video saved to: {video_path}")
         
-        # Extract frames
-        print("Extracting frames...")
-        frames, video_metadata = await video_processor.extract_frames(
+        # Extract and process frames
+        print("Extracting and processing frames...")
+        all_frames = []
+        final_metadata = {}
+        
+        # Use async for to properly handle the generator
+        async for frames_chunk, chunk_metadata in video_processor.extract_frames(
             video_path,
             target_fps=target_fps,
             max_duration=max_duration
-        )
+        ):
+            if not frames_chunk and chunk_metadata.get("error"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=chunk_metadata["error"]
+                )
+            
+            all_frames.extend(frames_chunk)
+            final_metadata.update(chunk_metadata)
         
-        print(f"Frame extraction complete. Frames extracted: {len(frames)}")
-        print(f"Video metadata: {video_metadata}")
-        
-        if not frames:
+        if not all_frames:
             raise HTTPException(
                 status_code=400,
-                detail=f"No frames could be extracted from video: {video_metadata.get('error', 'Unknown error')}"
+                detail="No frames could be extracted from video"
             )
         
-        # Process frames
+        print(f"Frames extracted: {len(all_frames)}")
+        print(f"Video metadata: {final_metadata}")
+        
+        # Process frames for pose estimation
         print("Processing frames for pose estimation...")
         try:
-            all_keypoints = await pose_estimator.process_frames(frames)
+            all_keypoints = await pose_estimator.process_frames(all_frames)
             
             # Track processing progress
             frames_processed = len(all_keypoints) if all_keypoints else 0
-            frames_total = len(frames)
+            frames_total = len(all_frames)
             
             processing_metadata = {
                 "frames_processed": frames_processed,
@@ -142,7 +154,7 @@ async def process_video(
                 error=f"Frame processing failed: {str(e)}",
                 metadata={
                     "frames_processed": len(all_keypoints) if 'all_keypoints' in locals() else 0,
-                    "frames_total": len(frames),
+                    "frames_total": len(all_frames),
                     "error_type": type(e).__name__
                 }
             )
@@ -172,7 +184,7 @@ async def process_video(
                 **processing_metadata,
                 "filename": video.filename,
                 "frames_with_pose": len(valid_keypoints),
-                "detection_rate": len(valid_keypoints) / len(frames)
+                "detection_rate": len(valid_keypoints) / len(all_frames)
             },
             confidence_metrics=confidence_metrics
         )
