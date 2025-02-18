@@ -78,25 +78,77 @@ async def process_video(
         
         # Process frames
         print("Processing frames for pose estimation...")
-        all_keypoints = await pose_estimator.process_frames(frames)
-        
-        # Filter out None values and get the most recent valid keypoints
-        valid_keypoints = [kp for kp in all_keypoints if kp is not None]
-        latest_keypoints = valid_keypoints[-1] if valid_keypoints else None
+        try:
+            all_keypoints = await pose_estimator.process_frames(frames)
+            
+            # Track processing progress
+            frames_processed = len(all_keypoints) if all_keypoints else 0
+            frames_total = len(frames)
+            
+            processing_metadata = {
+                "frames_processed": frames_processed,
+                "frames_total": frames_total,
+                "processing_rate": f"{(frames_processed/frames_total)*100:.1f}%"
+            }
+            
+            # Early exit if no keypoints detected
+            if not all_keypoints:
+                return PoseEstimationResponse(
+                    status=ProcessingStatus.COMPLETED,
+                    metadata={
+                        **processing_metadata,
+                        "error": "No keypoints were detected during processing"
+                    }
+                )
+            
+            # Warn if not all frames were processed
+            if frames_processed < frames_total:
+                print(f"Warning: Only processed {frames_processed}/{frames_total} frames")
+            
+            # Filter with additional validation
+            valid_keypoints = [
+                kp for kp in all_keypoints 
+                if kp is not None and len(kp) > 0 and any(
+                    keypoint.confidence > settings.GLOBAL_CONFIDENCE_THRESHOLD 
+                    for keypoint in kp
+                )
+            ]
+            
+            # Handle case with no valid keypoints
+            if not valid_keypoints:
+                return PoseEstimationResponse(
+                    status=ProcessingStatus.COMPLETED,
+                    metadata={
+                        **processing_metadata,
+                        "error": "No valid keypoints met confidence threshold",
+                        "keypoints_detected": len(all_keypoints),
+                        "keypoints_valid": 0
+                    }
+                )
+            
+            latest_keypoints = valid_keypoints[-1]
+            
+            # Add success metadata
+            processing_metadata.update({
+                "keypoints_detected": len(all_keypoints),
+                "keypoints_valid": len(valid_keypoints),
+                "confidence_rate": f"{(len(valid_keypoints)/len(all_keypoints))*100:.1f}%"
+            })
+            
+        except Exception as e:
+            print(f"Error during frame processing: {str(e)}")
+            return PoseEstimationResponse(
+                status=ProcessingStatus.FAILED,
+                error=f"Frame processing failed: {str(e)}",
+                metadata={
+                    "frames_processed": len(all_keypoints) if 'all_keypoints' in locals() else 0,
+                    "frames_total": len(frames),
+                    "error_type": type(e).__name__
+                }
+            )
         
         # Clean up the temporary file
         await video_processor.cleanup(video_path)
-        
-        # If no valid keypoints were found
-        if not valid_keypoints:
-            return PoseEstimationResponse(
-                status=ProcessingStatus.COMPLETED,
-                metadata={
-                    **video_metadata,
-                    "filename": video.filename,
-                    "message": "No pose detected in any frame"
-                }
-            )
         
         # Calculate confidence metrics
         confidence_by_part = {}
@@ -117,7 +169,7 @@ async def process_video(
             status=ProcessingStatus.COMPLETED,
             keypoints=latest_keypoints,
             metadata={
-                **video_metadata,
+                **processing_metadata,
                 "filename": video.filename,
                 "frames_with_pose": len(valid_keypoints),
                 "detection_rate": len(valid_keypoints) / len(frames)

@@ -212,5 +212,10 @@ class MediaPipeEstimator:
 
     def __del__(self):
         """Cleanup resources"""
-        self.pose.close()
-        self.executor.shutdown(wait=False)
+        try:
+            if hasattr(self, 'pose'):
+                self.pose.close()
+            if hasattr(self, 'executor'):
+                self.executor.shutdown(wait=False)
+        except Exception as e:
+            print(f"Error during cleanup: {str(e)}")
