@@ -7,8 +7,16 @@ class Settings(BaseSettings):
     
     # Video Processing Settings
     MAX_VIDEO_SIZE_MB: int = 100
+    MAX_FRAMES_TO_PROCESS: int = 150  # About 5 seconds at 30fps
     SUPPORTED_FORMATS: list[str] = ["mp4", "avi", "mov"]
     TEMP_DIR: str = "/tmp/eyespy"
+    TARGET_RESOLUTION: tuple = (1280, 720)  # 720p
+    
+    # Processing Timeouts
+    FRAME_PROCESSING_TIMEOUT: int = 180  # 3 minutes max
+    
+    # Batch Processing
+    BATCH_SIZE: int = 10
     
     # Confidence Thresholds
     GLOBAL_CONFIDENCE_THRESHOLD: float = 0.5

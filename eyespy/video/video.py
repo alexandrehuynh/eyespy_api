@@ -45,10 +45,11 @@ class VideoProcessor:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.quality_assessor = AdaptiveFrameQualityAssessor()
         self.frame_selector = FrameSelector()
-        self.batch_size = 30
+        self.batch_size = settings.BATCH_SIZE
         self.buffer_size = 100
-        self.max_frames_to_process = 300 
-        self.min_quality_threshold = 0.3 
+        self.max_frames_to_process = settings.MAX_FRAMES_TO_PROCESS
+        self.min_quality_threshold = 0.3
+        self.target_resolution = settings.TARGET_RESOLUTION
 
     async def extract_frames(
         self,
@@ -121,11 +122,15 @@ class VideoProcessor:
         cap: cv2.VideoCapture,
         metadata: Dict
     ) -> AsyncGenerator[Tuple[List[np.ndarray], Dict], None]:
-        """Process video frames in chunks"""
-        frame_buffer = FrameBuffer(maxsize=self.buffer_size)
-        result_buffer = FrameBuffer(maxsize=self.buffer_size)
+        """Process video frames in chunks with progress tracking"""
+        frame_buffer = FrameBuffer(maxsize=self.batch_size)
+        result_buffer = FrameBuffer(maxsize=self.batch_size)
+        frames_processed = 0
+        start_time = time.time()
         
         try:
+            print(f"Starting frame processing with target {metadata['max_frames']} frames")
+            
             # Start processing tasks
             reader_task = asyncio.create_task(
                 self._frame_reader(cap, frame_buffer, metadata)
@@ -134,18 +139,20 @@ class VideoProcessor:
                 self._quality_assessor(frame_buffer, result_buffer)
             )
             
-            frames_processed = 0
-            current_chunk: List[np.ndarray] = []
-            chunk_metadata: Dict = {"chunk_index": 0}
+            current_chunk = []
+            chunk_metadata = {"chunk_index": 0}
             
-            while True:
-                result_data = await result_buffer.get()
-                if result_data is None:  # End of processing
-                    if current_chunk:  # Yield final chunk
-                        yield current_chunk, chunk_metadata
+            while frames_processed < metadata['max_frames']:
+                # Check processing timeout
+                if time.time() - start_time > settings.FRAME_PROCESSING_TIMEOUT:
+                    print("Frame processing timeout reached")
                     break
                 
-                # Process quality results
+                result_data = await result_buffer.get()
+                if result_data is None:  # End of processing
+                    break
+                
+                # Process quality results with progress tracking
                 quality_frames = [
                     frame for frame, metrics in zip(
                         result_data['frames'], 
@@ -157,11 +164,18 @@ class VideoProcessor:
                 current_chunk.extend(quality_frames)
                 frames_processed += len(quality_frames)
                 
+                # Log progress
+                if frames_processed % 30 == 0:  # Log every ~second
+                    elapsed = time.time() - start_time
+                    fps = frames_processed / elapsed
+                    print(f"Processed {frames_processed}/{metadata['max_frames']} frames ({fps:.1f} fps)")
+                
                 # Yield chunk when it reaches batch size
                 if len(current_chunk) >= self.batch_size:
                     chunk_metadata.update({
                         "frames_processed": frames_processed,
                         "chunk_size": len(current_chunk),
+                        "processing_fps": frames_processed / (time.time() - start_time),
                         "memory_usage": self._get_memory_usage()
                     })
                     
@@ -183,14 +197,12 @@ class VideoProcessor:
             for task in [reader_task, quality_task]:
                 if not task.done():
                     task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
             
             # Clear buffers
             await self._clear_buffer(frame_buffer)
             await self._clear_buffer(result_buffer)
+            
+            print(f"Frame processing completed: {frames_processed} frames in {time.time() - start_time:.1f}s")
 
     async def _frame_reader(
         self,
@@ -471,3 +483,40 @@ class VideoProcessor:
                 file_path.unlink()
         except Exception as e:
             print(f"Error during cleanup: {str(e)}")
+
+    def _optimize_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Optimize frame for processing"""
+        try:
+            # Resize to target resolution
+            current_height, current_width = frame.shape[:2]
+            target_width, target_height = self.target_resolution
+            
+            # Only resize if current resolution is higher than target
+            if current_width > target_width or current_height > target_height:
+                # Maintain aspect ratio
+                aspect = current_width / current_height
+                if aspect > target_width / target_height:
+                    new_width = target_width
+                    new_height = int(target_width / aspect)
+                else:
+                    new_height = target_height
+                    new_width = int(target_height * aspect)
+                
+                frame = cv2.resize(frame, (new_width, new_height))
+                print(f"Resized frame from {current_width}x{current_height} to {new_width}x{new_height}")
+
+            # Ensure correct format and memory optimization
+            if len(frame.shape) == 2:  # If grayscale
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif frame.shape[2] == 4:  # If RGBA
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+            
+            # Ensure frame is contiguous and optimized
+            if not frame.flags['C_CONTIGUOUS']:
+                frame = np.ascontiguousarray(frame)
+            
+            return frame
+            
+        except Exception as e:
+            print(f"Error optimizing frame: {str(e)}")
+            return frame

@@ -29,12 +29,19 @@ async def process_video(
     target_fps: int = 30,
     max_duration: int = 10
 ) -> PoseEstimationResponse:
-    """
-    Process video for pose estimation with multi-frame support
-    """
+    """Process video for pose estimation with multi-frame support"""
     video_path = None
+    processing_start = time.time()
+    
     try:
-        print(f"Received video: {video.filename}, size: {video.size} bytes")
+        print(f"Received video: {video.filename}, size: {video.size/1024/1024:.1f}MB")
+        
+        # Validate video size
+        if video.size > settings.MAX_VIDEO_SIZE_MB * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video too large. Maximum size: {settings.MAX_VIDEO_SIZE_MB}MB"
+            )
         
         # Validate video format
         if not any(video.filename.lower().endswith(fmt) 
@@ -63,8 +70,8 @@ async def process_video(
         print("Extracting and processing frames...")
         all_frames = []
         final_metadata = {}
+        frames_start = time.time()
         
-        # Use async for to properly handle the generator
         async for frames_chunk, chunk_metadata in video_processor.extract_frames(
             video_path,
             target_fps=target_fps,
@@ -78,6 +85,13 @@ async def process_video(
             
             all_frames.extend(frames_chunk)
             final_metadata.update(chunk_metadata)
+            
+            # Log progress for large videos
+            if len(all_frames) % 50 == 0:
+                print(f"Extracted {len(all_frames)} frames...")
+        
+        frames_time = time.time() - frames_start
+        print(f"Frame extraction complete. {len(all_frames)} frames in {frames_time:.1f}s")
         
         if not all_frames:
             raise HTTPException(
@@ -85,11 +99,9 @@ async def process_video(
                 detail="No frames could be extracted from video"
             )
         
-        print(f"Frames extracted: {len(all_frames)}")
-        print(f"Video metadata: {final_metadata}")
-        
         # Process frames for pose estimation
         print("Processing frames for pose estimation...")
+        pose_start = time.time()
         try:
             all_keypoints = await pose_estimator.process_frames(all_frames)
             
@@ -100,7 +112,10 @@ async def process_video(
             processing_metadata = {
                 "frames_processed": frames_processed,
                 "frames_total": frames_total,
-                "processing_rate": f"{(frames_processed/frames_total)*100:.1f}%"
+                "processing_rate": f"{(frames_processed/frames_total)*100:.1f}%",
+                "extraction_time": frames_time,
+                "pose_time": time.time() - pose_start,
+                "total_time": time.time() - processing_start
             }
             
             # Early exit if no keypoints detected
@@ -112,10 +127,6 @@ async def process_video(
                         "error": "No keypoints were detected during processing"
                     }
                 )
-            
-            # Warn if not all frames were processed
-            if frames_processed < frames_total:
-                print(f"Warning: Only processed {frames_processed}/{frames_total} frames")
             
             # Filter with additional validation
             valid_keypoints = [
@@ -144,7 +155,12 @@ async def process_video(
             processing_metadata.update({
                 "keypoints_detected": len(all_keypoints),
                 "keypoints_valid": len(valid_keypoints),
-                "confidence_rate": f"{(len(valid_keypoints)/len(all_keypoints))*100:.1f}%"
+                "confidence_rate": f"{(len(valid_keypoints)/len(all_keypoints))*100:.1f}%",
+                "performance": {
+                    "fps": frames_total / processing_metadata["total_time"],
+                    "extraction_fps": frames_total / frames_time,
+                    "pose_fps": frames_total / processing_metadata["pose_time"]
+                }
             })
             
         except Exception as e:
@@ -155,7 +171,8 @@ async def process_video(
                 metadata={
                     "frames_processed": len(all_keypoints) if 'all_keypoints' in locals() else 0,
                     "frames_total": len(all_frames),
-                    "error_type": type(e).__name__
+                    "error_type": type(e).__name__,
+                    "processing_time": time.time() - processing_start
                 }
             )
         
@@ -199,5 +216,6 @@ async def process_video(
                 
         return PoseEstimationResponse(
             status=ProcessingStatus.FAILED,
-            error=str(e)
+            error=str(e),
+            metadata={"processing_time": time.time() - processing_start}
         )
