@@ -12,7 +12,6 @@ import psutil
 import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-import tracemalloc
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -31,8 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-tracemalloc.start()
-
 @app.get("/")
 async def root():
     return {"message": "Welcome to EyeSpy API"}
@@ -42,21 +39,17 @@ async def process_video(
     video: UploadFile = File(...),
     target_fps: Optional[int] = None,
     max_duration: Optional[int] = None,
-    batch_size: int = 50  # Allow batch size to be configurable
+    batch_size: int = 50
 ) -> PoseEstimationResponse:
-    """
-    Process video in streaming mode with performance monitoring.
-    """
     processing_start = time.time()
     video_processor = VideoProcessor(batch_size=batch_size)
     pose_estimator = MediaPipeEstimator()
     movenet_estimator = MovenetEstimator()
     pose_fusion = PoseFusion()
     
-    # Performance metrics
     processed_frames = 0
-    batch_times: List[float] = []
-    memory_usage: List[float] = []
+    batch_times = []
+    memory_usage = []
     
     try:
         video_path = await video_processor.save_upload(video)
@@ -90,21 +83,18 @@ async def process_video(
                     fused_kp = await pose_fusion.fuse_predictions(mp_kp, mn_kp)
                     fused_results.append(fused_kp)
                 
-                # Update metrics
+                # Update metrics safely
                 processed_frames += len(fused_results)
                 batch_time = time.time() - batch_start
                 batch_times.append(batch_time)
-                
-                # Monitor memory
-                memory_percent = psutil.Process().memory_percent()
-                memory_usage.append(memory_percent)
+                memory_usage.append(psutil.Process().memory_percent())
                 
                 # Log performance metrics
                 fps = len(frames_chunk) / batch_time
                 logger.info(
                     f"Batch processed: {processed_frames} frames total, "
                     f"Batch FPS: {fps:.1f}, "
-                    f"Memory usage: {memory_percent:.1f}%"
+                    f"Memory usage: {memory_usage[-1]:.1f}%"
                 )
                 
                 # Free memory explicitly
@@ -117,49 +107,37 @@ async def process_video(
                 continue
             
             # Optional: Add delay if memory usage is too high
-            if memory_percent > 80:  # Arbitrary threshold
+            if memory_usage[-1] > 80:  # Arbitrary threshold
                 logger.warning("High memory usage detected, adding small delay")
                 await asyncio.sleep(0.1)
         
-        # Calculate final performance metrics
+        # Calculate final metrics safely
         total_time = time.time() - processing_start
-        avg_fps = processed_frames / total_time
-        avg_batch_time = sum(batch_times) / len(batch_times)
-        avg_memory = sum(memory_usage) / len(memory_usage)
+        avg_fps = processed_frames / total_time if total_time > 0 else 0
+        avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
+        avg_memory = sum(memory_usage) / len(memory_usage) if memory_usage else 0
         
-        performance_metrics = {
-            "total_frames": processed_frames,
-            "total_time_seconds": total_time,
-            "average_fps": avg_fps,
-            "average_batch_time": avg_batch_time,
-            "average_memory_percent": avg_memory,
-            "peak_memory_percent": max(memory_usage),
-            "batch_size": batch_size
-        }
-        
-        logger.info(f"Processing complete. Metrics: {performance_metrics}")
-        
-        snapshot = tracemalloc.take_snapshot()
-        top_stats = snapshot.statistics('lineno')
-        logger.info("[ Top 10 memory allocations ]")
-        for stat in top_stats[:10]:
-            logger.info(stat)
+        logger.info(f"Processing complete. Metrics: {avg_fps:.1f} FPS, {avg_batch_time:.3f} seconds per batch, {avg_memory:.1f}% memory usage")
         
         return PoseEstimationResponse(
-            status=ProcessingStatus.COMPLETED,
+            status="success" if processed_frames > 0 else "failed",
+            keypoints=fused_results if processed_frames > 0 else None,
             metadata={
-                "performance": performance_metrics,
+                "processing_time": total_time,
                 "frames_processed": processed_frames,
-                "processing_time": total_time
+                "average_fps": avg_fps,
+                "average_batch_time": avg_batch_time,
+                "average_memory_usage": avg_memory
             }
         )
-        
+
     except Exception as e:
         logger.error(f"Error processing video: {str(e)}")
         return PoseEstimationResponse(
-            status=ProcessingStatus.FAILED,
-            error=str(e),
-            metadata={"processing_time": time.time() - processing_start}
+            status="failed",
+            keypoints=None,
+            metadata={"processing_time": time.time() - processing_start},
+            error=str(e)
         )
     finally:
         # Cleanup

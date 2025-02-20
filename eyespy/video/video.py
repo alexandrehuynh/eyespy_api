@@ -226,18 +226,22 @@ class VideoProcessor:
                 if batch_data is None:
                     break
                 
-                # Process batch with proper async handling
-                batch_metrics = await self._process_batch(batch_data['frames'])
+                if not isinstance(batch_data, dict) or 'frame' not in batch_data:
+                    logger.error(f"Invalid batch data format: {batch_data}")
+                    continue
+                    
+                # Process single frame (changed from batch_data['frames'])
+                frame_metrics = await self._process_batch([batch_data['frame']])
                 
                 # Add quality results to result buffer
                 await result_buffer.put({
-                    'frames': batch_data['frames'],
-                    'indices': batch_data['indices'],
-                    'metrics': batch_metrics
+                    'frames': [batch_data['frame']],
+                    'indices': [batch_data['index']],
+                    'metrics': frame_metrics
                 })
                 
         finally:
-            result_buffer.put(None)
+            await result_buffer.put(None)
 
     async def _perform_calibration(self, cap: cv2.VideoCapture) -> Optional[Dict]:
         """Perform initial calibration and return calibration data"""
