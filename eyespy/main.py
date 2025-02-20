@@ -12,6 +12,7 @@ import psutil
 import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import tracemalloc
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +30,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+tracemalloc.start()
 
 @app.get("/")
 async def root():
@@ -135,6 +138,12 @@ async def process_video(
         }
         
         logger.info(f"Processing complete. Metrics: {performance_metrics}")
+        
+        snapshot = tracemalloc.take_snapshot()
+        top_stats = snapshot.statistics('lineno')
+        logger.info("[ Top 10 memory allocations ]")
+        for stat in top_stats[:10]:
+            logger.info(stat)
         
         return PoseEstimationResponse(
             status=ProcessingStatus.COMPLETED,

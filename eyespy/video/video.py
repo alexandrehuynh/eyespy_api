@@ -1,3 +1,4 @@
+import logging
 from fastapi import UploadFile
 import time
 import cv2
@@ -10,6 +11,10 @@ from ..config import settings
 from .quality import AdaptiveFrameQualityAssessor, QualityMetrics
 from .frame_selector import FrameSelector
 from concurrent.futures import ThreadPoolExecutor
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class FrameBuffer:
     """Thread-safe frame buffer for parallel processing"""
@@ -143,43 +148,31 @@ class VideoProcessor:
         frame_buffer: asyncio.Queue,
         executor: ThreadPoolExecutor,
         metadata: Dict
-    ):
-        """Read frames and add to buffer"""
+    ) -> None:
+        """Read frames from video and put them in buffer"""
         try:
-            frames_read = 0
-            frame_interval = metadata["frame_interval"]
-            
-            while True:
-                batch_frames = []
-                batch_indices = []
-                
-                # Read batch of frames
-                for _ in range(min(self.batch_size, cap.get(cv2.CAP_PROP_FRAME_COUNT) - frames_read)):
-                    # Skip frames according to target FPS
-                    for _ in range(frame_interval - 1):
-                        cap.grab()
-                    
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    
-                    frame = self._optimize_frame(frame)
-                    batch_frames.append(frame)
-                    batch_indices.append(frames_read)
-                    frames_read += 1
-                
-                if not batch_frames:
+            frame_count = 0
+            while cap.isOpened():
+                ret, frame = await asyncio.get_event_loop().run_in_executor(
+                    executor, cap.read
+                )
+                if not ret:
                     break
                 
-                await frame_buffer.put({
-                    'frames': batch_frames,
-                    'indices': batch_indices
-                })
+                if frame_count % metadata['frame_interval'] == 0:
+                    await frame_buffer.put({
+                        'frame': frame,
+                        'index': frame_count
+                    })
                 
-                await asyncio.sleep(0)
+                frame_count += 1
                 
-        finally:
-            frame_buffer.put(None)
+            # Signal end of processing
+            await frame_buffer.put(None)
+            
+        except Exception as e:
+            logger.error(f"Error in frame reader: {str(e)}")
+            await frame_buffer.put(None)
 
     async def _process_batch(self, frames: List[np.ndarray]) -> List[QualityMetrics]:
         """Process a batch of frames with proper async handling"""
