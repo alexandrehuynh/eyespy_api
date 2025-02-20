@@ -41,14 +41,20 @@ class FrameBuffer:
         self.completed.set()
 
 class VideoProcessor:
-    def __init__(self):
+    def __init__(
+        self,
+        batch_size: int = 50,
+        buffer_size: int = 100,
+        min_quality_threshold: float = 0.5
+    ):
+        """Initialize VideoProcessor with configurable parameters"""
+        self.batch_size = batch_size
+        self.buffer_size = buffer_size
+        self.min_quality_threshold = min_quality_threshold
+        self.frame_selector = FrameSelector()
         self.temp_dir = Path(settings.TEMP_DIR)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.quality_assessor = AdaptiveFrameQualityAssessor()
-        self.frame_selector = FrameSelector()
-        self.batch_size = 30
-        self.buffer_size = 100
-        self.min_quality_threshold = 0.3
 
     async def extract_frames(
         self,
