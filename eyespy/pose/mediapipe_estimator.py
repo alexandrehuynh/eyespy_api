@@ -11,6 +11,13 @@ from .confidence import AdaptiveConfidenceAssessor
 from .tracker import ConfidenceTracker
 from .movenet_estimator import MovenetEstimator
 from .fusion import PoseFusion
+import time
+import psutil
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class MediaPipeEstimator:
     def __init__(self):
@@ -33,44 +40,59 @@ class MediaPipeEstimator:
         self.confidence_tracker = ConfidenceTracker()
         
         # Performance optimizations
-        self.executor = ThreadPoolExecutor(max_workers=4)
-        self.batch_size = 5
+        cpu_count = psutil.cpu_count(logical=False)  # Physical cores only
+        self.executor = ThreadPoolExecutor(
+            max_workers=max(4, cpu_count - 1)  # Leave one core free for other tasks
+        )
+        self.batch_size = 50  # Increased from default
         self.frame_metadata = {}
+        
+        # Add performance monitoring
+        self.processing_times: List[float] = []
 
     async def process_frames(
         self,
         frames: List[np.ndarray],
         batch_size: Optional[int] = None
     ) -> List[Optional[List[Keypoint]]]:
-        """Process frames using both models with parallel processing"""
+        """Process frames using optimized batching"""
         if batch_size is None:
             batch_size = self.batch_size
-
+            
         all_keypoints = []
+        total_frames = len(frames)
         
-        # Process frames in batches
-        for i in range(0, len(frames), batch_size):
+        # Process in optimized batches
+        for i in range(0, total_frames, batch_size):
+            batch_start = time.time()
+            
+            # Get current batch
             batch = frames[i:i + batch_size]
             
-            # Run both models in parallel
-            mediapipe_task = self._process_mediapipe_batch(batch)
-            movenet_task = self.movenet.process_frames(batch)
+            try:
+                # Process batch
+                batch_keypoints = await self._process_mediapipe_batch(batch)
+                all_keypoints.extend(batch_keypoints)
+                
+                # Record performance
+                batch_time = time.time() - batch_start
+                self.processing_times.append(batch_time)
+                
+                # Log performance
+                fps = len(batch) / batch_time
+                logger.info(
+                    f"MediaPipe Batch {i//batch_size}: "
+                    f"Processed {len(batch)} frames at {fps:.1f} FPS"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error in MediaPipe batch {i//batch_size}: {str(e)}")
+                # Continue with next batch instead of failing completely
+                continue
             
-            # Wait for both models to complete
-            mp_keypoints, mn_keypoints = await asyncio.gather(
-                mediapipe_task,
-                movenet_task
-            )
-            
-            # Process each frame's results
-            batch_results = await self._process_batch_results(
-                mp_keypoints,
-                mn_keypoints
-            )
-            
-            all_keypoints.extend(batch_results)
+            # Allow other tasks to run
             await asyncio.sleep(0)
-        
+            
         return all_keypoints
 
     async def _process_mediapipe_batch(

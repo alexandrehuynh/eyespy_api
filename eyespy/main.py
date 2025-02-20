@@ -4,7 +4,18 @@ from .config import settings
 from .models import PoseEstimationResponse, ProcessingStatus, ConfidenceMetrics, Keypoint
 from .video import VideoProcessor
 from .pose.mediapipe_estimator import MediaPipeEstimator
+from .pose.movenet_estimator import MovenetEstimator
+from .pose.pose_fusion import PoseFusion
 import time
+from typing import Optional, Dict, List
+import psutil
+import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title=settings.API_NAME,
@@ -26,196 +37,122 @@ async def root():
 @app.post("/api/v1/pose", response_model=PoseEstimationResponse)
 async def process_video(
     video: UploadFile = File(...),
-    target_fps: int = 30,
-    max_duration: int = 10
+    target_fps: Optional[int] = None,
+    max_duration: Optional[int] = None,
+    batch_size: int = 50  # Allow batch size to be configurable
 ) -> PoseEstimationResponse:
-    """Process video for pose estimation with multi-frame support"""
-    video_path = None
+    """
+    Process video in streaming mode with performance monitoring.
+    """
     processing_start = time.time()
+    video_processor = VideoProcessor(batch_size=batch_size)
+    pose_estimator = MediaPipeEstimator()
+    movenet_estimator = MovenetEstimator()
+    pose_fusion = PoseFusion()
+    
+    # Performance metrics
+    processed_frames = 0
+    batch_times: List[float] = []
+    memory_usage: List[float] = []
     
     try:
-        print(f"Received video: {video.filename}, size: {video.size/1024/1024:.1f}MB")
-        
-        # Validate video size
-        if video.size > settings.MAX_VIDEO_SIZE_MB * 1024 * 1024:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Video too large. Maximum size: {settings.MAX_VIDEO_SIZE_MB}MB"
-            )
-        
-        # Validate video format
-        if not any(video.filename.lower().endswith(fmt) 
-                  for fmt in settings.SUPPORTED_FORMATS):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported video format. Supported formats: {settings.SUPPORTED_FORMATS}"
-            )
-        
-        # Initialize processors
-        video_processor = VideoProcessor()
-        pose_estimator = MediaPipeEstimator()
-        
-        # Save uploaded file
-        print("Saving uploaded file...")
         video_path = await video_processor.save_upload(video)
         if not video_path:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to save video file"
-            )
+            raise HTTPException(status_code=400, detail="Unable to save video")
         
-        print(f"Video saved to: {video_path}")
-        
-        # Extract and process frames
-        print("Extracting and processing frames...")
-        all_frames = []
-        final_metadata = {}
-        frames_start = time.time()
-        
+        # Process frames in streaming mode
         async for frames_chunk, chunk_metadata in video_processor.extract_frames(
             video_path,
-            target_fps=target_fps,
-            max_duration=max_duration
+            target_fps=target_fps
         ):
-            if not frames_chunk and chunk_metadata.get("error"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=chunk_metadata["error"]
+            if not frames_chunk:
+                continue
+            
+            batch_start = time.time()
+            
+            # Process chunk with both models in parallel
+            try:
+                # Run both models concurrently
+                mediapipe_task = pose_estimator.process_frames(frames_chunk)
+                movenet_task = movenet_estimator.process_frames(frames_chunk)
+                
+                mp_keypoints, mn_keypoints = await asyncio.gather(
+                    mediapipe_task,
+                    movenet_task
                 )
-            
-            all_frames.extend(frames_chunk)
-            final_metadata.update(chunk_metadata)
-            
-            # Log progress for large videos
-            if len(all_frames) % 50 == 0:
-                print(f"Extracted {len(all_frames)} frames...")
-        
-        frames_time = time.time() - frames_start
-        print(f"Frame extraction complete. {len(all_frames)} frames in {frames_time:.1f}s")
-        
-        if not all_frames:
-            raise HTTPException(
-                status_code=400,
-                detail="No frames could be extracted from video"
-            )
-        
-        # Process frames for pose estimation
-        print("Processing frames for pose estimation...")
-        pose_start = time.time()
-        try:
-            all_keypoints = await pose_estimator.process_frames(all_frames)
-            
-            # Track processing progress
-            frames_processed = len(all_keypoints) if all_keypoints else 0
-            frames_total = len(all_frames)
-            
-            processing_metadata = {
-                "frames_processed": frames_processed,
-                "frames_total": frames_total,
-                "processing_rate": f"{(frames_processed/frames_total)*100:.1f}%",
-                "extraction_time": frames_time,
-                "pose_time": time.time() - pose_start,
-                "total_time": time.time() - processing_start
-            }
-            
-            # Early exit if no keypoints detected
-            if not all_keypoints:
-                return PoseEstimationResponse(
-                    status=ProcessingStatus.COMPLETED,
-                    metadata={
-                        **processing_metadata,
-                        "error": "No keypoints were detected during processing"
-                    }
+                
+                # Fuse results for each frame in the chunk
+                fused_results = []
+                for mp_kp, mn_kp in zip(mp_keypoints, mn_keypoints):
+                    fused_kp = await pose_fusion.fuse_predictions(mp_kp, mn_kp)
+                    fused_results.append(fused_kp)
+                
+                # Update metrics
+                processed_frames += len(fused_results)
+                batch_time = time.time() - batch_start
+                batch_times.append(batch_time)
+                
+                # Monitor memory
+                memory_percent = psutil.Process().memory_percent()
+                memory_usage.append(memory_percent)
+                
+                # Log performance metrics
+                fps = len(frames_chunk) / batch_time
+                logger.info(
+                    f"Batch processed: {processed_frames} frames total, "
+                    f"Batch FPS: {fps:.1f}, "
+                    f"Memory usage: {memory_percent:.1f}%"
                 )
+                
+                # Free memory explicitly
+                del frames_chunk
+                del mp_keypoints
+                del mn_keypoints
+                
+            except Exception as batch_error:
+                logger.error(f"Error processing batch: {str(batch_error)}")
+                continue
             
-            # Filter with additional validation
-            valid_keypoints = [
-                kp for kp in all_keypoints 
-                if kp is not None and len(kp) > 0 and any(
-                    keypoint.confidence > settings.GLOBAL_CONFIDENCE_THRESHOLD 
-                    for keypoint in kp
-                )
-            ]
-            
-            # Handle case with no valid keypoints
-            if not valid_keypoints:
-                return PoseEstimationResponse(
-                    status=ProcessingStatus.COMPLETED,
-                    metadata={
-                        **processing_metadata,
-                        "error": "No valid keypoints met confidence threshold",
-                        "keypoints_detected": len(all_keypoints),
-                        "keypoints_valid": 0
-                    }
-                )
-            
-            latest_keypoints = valid_keypoints[-1]
-            
-            # Add success metadata
-            processing_metadata.update({
-                "keypoints_detected": len(all_keypoints),
-                "keypoints_valid": len(valid_keypoints),
-                "confidence_rate": f"{(len(valid_keypoints)/len(all_keypoints))*100:.1f}%",
-                "performance": {
-                    "fps": frames_total / processing_metadata["total_time"],
-                    "extraction_fps": frames_total / frames_time,
-                    "pose_fps": frames_total / processing_metadata["pose_time"]
-                }
-            })
-            
-        except Exception as e:
-            print(f"Error during frame processing: {str(e)}")
-            return PoseEstimationResponse(
-                status=ProcessingStatus.FAILED,
-                error=f"Frame processing failed: {str(e)}",
-                metadata={
-                    "frames_processed": len(all_keypoints) if 'all_keypoints' in locals() else 0,
-                    "frames_total": len(all_frames),
-                    "error_type": type(e).__name__,
-                    "processing_time": time.time() - processing_start
-                }
-            )
+            # Optional: Add delay if memory usage is too high
+            if memory_percent > 80:  # Arbitrary threshold
+                logger.warning("High memory usage detected, adding small delay")
+                await asyncio.sleep(0.1)
         
-        # Clean up the temporary file
-        await video_processor.cleanup(video_path)
+        # Calculate final performance metrics
+        total_time = time.time() - processing_start
+        avg_fps = processed_frames / total_time
+        avg_batch_time = sum(batch_times) / len(batch_times)
+        avg_memory = sum(memory_usage) / len(memory_usage)
         
-        # Calculate confidence metrics
-        confidence_by_part = {}
-        avg_confidence = 0.0
+        performance_metrics = {
+            "total_frames": processed_frames,
+            "total_time_seconds": total_time,
+            "average_fps": avg_fps,
+            "average_batch_time": avg_batch_time,
+            "average_memory_percent": avg_memory,
+            "peak_memory_percent": max(memory_usage),
+            "batch_size": batch_size
+        }
         
-        if latest_keypoints:
-            for kp in latest_keypoints:
-                confidence_by_part[kp.name] = kp.confidence
-            avg_confidence = sum(kp.confidence for kp in latest_keypoints) / len(latest_keypoints)
+        logger.info(f"Processing complete. Metrics: {performance_metrics}")
         
-        confidence_metrics = ConfidenceMetrics(
-            average_confidence=avg_confidence,
-            keypoints=confidence_by_part
-        )
-        
-        # Return successful response with keypoints and metrics
         return PoseEstimationResponse(
             status=ProcessingStatus.COMPLETED,
-            keypoints=latest_keypoints,
             metadata={
-                **processing_metadata,
-                "filename": video.filename,
-                "frames_with_pose": len(valid_keypoints),
-                "detection_rate": len(valid_keypoints) / len(all_frames)
-            },
-            confidence_metrics=confidence_metrics
+                "performance": performance_metrics,
+                "frames_processed": processed_frames,
+                "processing_time": total_time
+            }
         )
         
     except Exception as e:
-        print(f"Error processing video: {str(e)}")
-        if video_path:
-            try:
-                await video_processor.cleanup(video_path)
-            except Exception as cleanup_error:
-                print(f"Error during cleanup: {str(cleanup_error)}")
-                
+        logger.error(f"Error processing video: {str(e)}")
         return PoseEstimationResponse(
             status=ProcessingStatus.FAILED,
             error=str(e),
             metadata={"processing_time": time.time() - processing_start}
         )
+    finally:
+        # Cleanup
+        if video_path:
+            await video_processor.cleanup(video_path)

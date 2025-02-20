@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from typing import Dict
+from typing import Dict, Optional
 
 class Settings(BaseSettings):
     API_NAME: str = "EyeSpy API"
@@ -7,16 +7,11 @@ class Settings(BaseSettings):
     
     # Video Processing Settings
     MAX_VIDEO_SIZE_MB: int = 100
-    MAX_FRAMES_TO_PROCESS: int = 150  # About 5 seconds at 30fps
     SUPPORTED_FORMATS: list[str] = ["mp4", "avi", "mov"]
     TEMP_DIR: str = "/tmp/eyespy"
-    TARGET_RESOLUTION: tuple = (1280, 720)  # 720p
-    
-    # Processing Timeouts
-    FRAME_PROCESSING_TIMEOUT: int = 180  # 3 minutes max
-    
-    # Batch Processing
-    BATCH_SIZE: int = 10
+    MAX_FRAMES_TO_PROCESS: Optional[int] = None  # Process the entire video
+    TARGET_FPS: int = 30
+    MAX_DIMENSION: int = 720  # Target 720p resolution
     
     # Confidence Thresholds
     GLOBAL_CONFIDENCE_THRESHOLD: float = 0.5
@@ -38,6 +33,17 @@ class Settings(BaseSettings):
         "LEFT_ANKLE": 0.4,
         "RIGHT_ANKLE": 0.4
     }
+
+    # Performance Settings
+    BATCH_SIZE: int = 50
+    MIN_MEMORY_THRESHOLD: float = 20.0  # Minimum free memory percentage
+    MAX_MEMORY_THRESHOLD: float = 80.0  # Maximum memory usage percentage
+    THREAD_POOL_WORKERS: Optional[int] = None  # None = auto-detect based on CPU
+    ENABLE_PERFORMANCE_LOGGING: bool = True
+    
+    # Monitoring Settings
+    LOG_BATCH_METRICS: bool = True
+    PERFORMANCE_LOG_INTERVAL: int = 100  # Log every N frames
 
     class Config:
         env_file = ".env"
