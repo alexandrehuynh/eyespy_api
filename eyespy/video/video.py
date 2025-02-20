@@ -9,6 +9,7 @@ from collections import deque
 from ..config import settings
 from .quality import AdaptiveFrameQualityAssessor, QualityMetrics
 from .frame_selector import FrameSelector
+from concurrent.futures import ThreadPoolExecutor
 
 class FrameBuffer:
     """Thread-safe frame buffer for parallel processing"""
@@ -57,136 +58,84 @@ class VideoProcessor:
     ) -> AsyncGenerator[Tuple[List[np.ndarray], dict], None]:
         """Extract frames using parallel processing with streaming"""
         if not video_path.exists():
-            print(f"Video file not found: {video_path}")
             yield [], self._create_error_metadata("Video file not found")
             return
 
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            print(f"Failed to open video: {video_path}")
             yield [], self._create_error_metadata("Failed to open video file")
             return
 
         try:
-            # Get video properties first
             metadata = await self._get_video_properties(cap)
-            print(f"Video properties: {metadata}")
-
             if metadata["total_frames"] == 0:
                 yield [], self._create_error_metadata("Video appears to be empty")
                 return
 
-            # Update metadata without frame limits
             metadata.update({
                 "target_fps": target_fps or metadata['original_fps'],
                 "frame_interval": max(1, metadata["original_fps"] // (target_fps or metadata['original_fps']))
             })
 
-            # Calibration phase
-            print("Starting calibration...")
-            calibration_data = await self._perform_calibration(cap)
-            if not calibration_data:
-                print("Calibration failed")
-                yield [], self._create_error_metadata("Calibration failed")
-                return
-            
-            print("Calibration completed successfully")
-            metadata["calibration"] = calibration_data
-            
-            # Reset video position
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            
-            # Process frames in chunks
-            async for frames_chunk, chunk_metadata in self._process_frame_chunks(cap, metadata):
-                if frames_chunk:
-                    yield frames_chunk, {**metadata, **chunk_metadata}
-                    
-        except Exception as e:
-            print(f"Error in extract_frames: {str(e)}")
-            yield [], self._create_error_metadata(str(e))
+            # Use ThreadPoolExecutor for frame reading
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                frame_buffer = asyncio.Queue(maxsize=self.buffer_size)
+                result_buffer = asyncio.Queue(maxsize=self.buffer_size)
+                
+                # Start frame reader and quality assessment tasks
+                reader_task = asyncio.create_task(
+                    self._frame_reader(cap, frame_buffer, executor, metadata)
+                )
+                quality_task = asyncio.create_task(
+                    self._quality_assessor(frame_buffer, result_buffer)
+                )
+                
+                try:
+                    while True:
+                        result_data = await result_buffer.get()
+                        if result_data is None:
+                            break
+                        
+                        # Process frames in batches
+                        frames = result_data['frames']
+                        metrics = result_data['metrics']
+                        
+                        # Filter quality frames using numpy operations
+                        quality_mask = np.array([
+                            m.is_valid and m.overall_score >= self.min_quality_threshold
+                            for m in metrics
+                        ])
+                        quality_frames = np.array(frames)[quality_mask]
+                        
+                        if len(quality_frames) > 0:
+                            yield quality_frames.tolist(), {
+                                **metadata,
+                                "frames_processed": len(quality_frames),
+                                "quality_metrics": self._calculate_quality_stats(
+                                    [m for i, m in enumerate(metrics) if quality_mask[i]]
+                                )
+                            }
+                        
+                        await asyncio.sleep(0)
+                        
+                finally:
+                    # Cleanup tasks
+                    for task in [reader_task, quality_task]:
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                pass
+                
         finally:
             cap.release()
-
-    async def _process_frame_chunks(
-        self,
-        cap: cv2.VideoCapture,
-        metadata: Dict
-    ) -> AsyncGenerator[Tuple[List[np.ndarray], Dict], None]:
-        """Process video frames in chunks"""
-        frame_buffer = FrameBuffer(maxsize=self.buffer_size)
-        result_buffer = FrameBuffer(maxsize=self.buffer_size)
-        
-        try:
-            # Start processing tasks
-            reader_task = asyncio.create_task(
-                self._frame_reader(cap, frame_buffer, metadata)
-            )
-            quality_task = asyncio.create_task(
-                self._quality_assessor(frame_buffer, result_buffer)
-            )
-            
-            frames_processed = 0
-            current_chunk: List[np.ndarray] = []
-            chunk_metadata: Dict = {"chunk_index": 0}
-            
-            while True:
-                result_data = await result_buffer.get()
-                if result_data is None:  # End of processing
-                    if current_chunk:  # Yield final chunk
-                        yield current_chunk, chunk_metadata
-                    break
-                
-                # Process quality results
-                quality_frames = [
-                    frame for frame, metrics in zip(
-                        result_data['frames'], 
-                        result_data['metrics']
-                    )
-                    if metrics.is_valid and metrics.overall_score >= self.min_quality_threshold
-                ]
-                
-                current_chunk.extend(quality_frames)
-                frames_processed += len(quality_frames)
-                
-                # Yield chunk when it reaches batch size
-                if len(current_chunk) >= self.batch_size:
-                    chunk_metadata.update({
-                        "frames_processed": frames_processed,
-                        "chunk_size": len(current_chunk),
-                        "memory_usage": self._get_memory_usage()
-                    })
-                    
-                    yield current_chunk, chunk_metadata
-                    
-                    # Reset chunk
-                    current_chunk = []
-                    chunk_metadata = {
-                        "chunk_index": chunk_metadata["chunk_index"] + 1
-                    }
-                
-                await asyncio.sleep(0)  # Allow other tasks to run
-                
-        except Exception as e:
-            print(f"Error in frame chunk processing: {str(e)}")
-            yield [], {"error": str(e)}
-        finally:
-            # Cleanup tasks
-            for task in [reader_task, quality_task]:
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-            
-            # Clear buffers
-            await self._clear_buffer(frame_buffer)
-            await self._clear_buffer(result_buffer)
 
     async def _frame_reader(
         self,
         cap: cv2.VideoCapture,
-        frame_buffer: FrameBuffer,
+        frame_buffer: asyncio.Queue,
+        executor: ThreadPoolExecutor,
         metadata: Dict
     ):
         """Read frames and add to buffer"""
@@ -224,7 +173,7 @@ class VideoProcessor:
                 await asyncio.sleep(0)
                 
         finally:
-            frame_buffer.mark_completed()
+            frame_buffer.put(None)
 
     async def _process_batch(self, frames: List[np.ndarray]) -> List[QualityMetrics]:
         """Process a batch of frames with proper async handling"""
@@ -232,7 +181,7 @@ class VideoProcessor:
             *[self.quality_assessor.assess_frame(frame) for frame in frames]
         )
 
-    async def _frame_selector(self, result_buffer: FrameBuffer) -> Tuple[List[np.ndarray], Dict]:
+    async def _frame_selector(self, result_buffer: asyncio.Queue) -> Tuple[List[np.ndarray], Dict]:
         """Select frames based on quality and distribution with proper async handling"""
         frames = []
         indices = []
@@ -270,7 +219,7 @@ class VideoProcessor:
             print(f"Frame selection error: {str(e)}")
             return [], {}
 
-    async def _quality_assessor(self, frame_buffer: FrameBuffer, result_buffer: FrameBuffer):
+    async def _quality_assessor(self, frame_buffer: asyncio.Queue, result_buffer: asyncio.Queue):
         """Process frames for quality with proper async handling"""
         try:
             while True:
@@ -289,7 +238,7 @@ class VideoProcessor:
                 })
                 
         finally:
-            result_buffer.mark_completed()
+            result_buffer.put(None)
 
     async def _perform_calibration(self, cap: cv2.VideoCapture) -> Optional[Dict]:
         """Perform initial calibration and return calibration data"""

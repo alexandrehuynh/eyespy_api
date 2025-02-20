@@ -12,98 +12,83 @@ class PoseFusion:
         self.mediapipe_weight = mediapipe_weight
         self.movenet_weight = movenet_weight
         self.confidence_threshold = confidence_threshold
+        self.keypoint_cache = {}
+        self.max_cache_size = 1000
 
     async def fuse_predictions(
         self,
         mediapipe_keypoints: Optional[List[Keypoint]],
         movenet_keypoints: Optional[List[Keypoint]]
     ) -> Optional[List[Keypoint]]:
-        """Fuse predictions from both models"""
+        """Fuse predictions using vectorized operations"""
         if not mediapipe_keypoints and not movenet_keypoints:
             return None
             
-        # If one model fails, use the other with reduced confidence
         if not mediapipe_keypoints:
             return self._adjust_confidence(movenet_keypoints, 0.8)
         if not movenet_keypoints:
             return self._adjust_confidence(mediapipe_keypoints, 0.8)
-        
-        # Create keypoint dictionaries for easy lookup
-        mp_dict = {kp.name: kp for kp in mediapipe_keypoints}
-        mn_dict = {kp.name: kp for kp in movenet_keypoints}
-        
-        # Fuse keypoints
-        fused_keypoints = []
-        
-        # Process all unique keypoint names
-        for name in set(mp_dict.keys()) | set(mn_dict.keys()):
-            mp_kp = mp_dict.get(name)
-            mn_kp = mn_dict.get(name)
-            
-            if mp_kp and mn_kp:
-                # Both models detected the keypoint
-                fused_kp = self._fuse_keypoint(mp_kp, mn_kp)
-                if fused_kp.confidence >= self.confidence_threshold:
-                    fused_keypoints.append(fused_kp)
-            elif mp_kp:
-                # Only MediaPipe detected the keypoint
-                if mp_kp.confidence >= self.confidence_threshold:
-                    fused_keypoints.append(mp_kp)
-            elif mn_kp:
-                # Only MoveNet detected the keypoint
-                if mn_kp.confidence >= self.confidence_threshold:
-                    fused_keypoints.append(mn_kp)
-        
-        return fused_keypoints if fused_keypoints else None
 
-    def _fuse_keypoint(
-        self,
-        mp_keypoint: Keypoint,
-        mn_keypoint: Keypoint
-    ) -> Keypoint:
-        """Fuse individual keypoint predictions"""
-        # Calculate weighted coordinates
-        x = (
-            mp_keypoint.x * self.mediapipe_weight * mp_keypoint.confidence +
-            mn_keypoint.x * self.movenet_weight * mn_keypoint.confidence
-        ) / (
-            self.mediapipe_weight * mp_keypoint.confidence +
-            self.movenet_weight * mn_keypoint.confidence
-        )
-        
-        y = (
-            mp_keypoint.y * self.mediapipe_weight * mp_keypoint.confidence +
-            mn_keypoint.y * self.movenet_weight * mn_keypoint.confidence
-        ) / (
-            self.mediapipe_weight * mp_keypoint.confidence +
-            self.movenet_weight * mn_keypoint.confidence
-        )
-        
-        # Combine confidences
-        confidence = max(
-            mp_keypoint.confidence * self.mediapipe_weight,
-            mn_keypoint.confidence * self.movenet_weight
-        )
-        
-        return Keypoint(
-            x=x,
-            y=y,
-            confidence=confidence,
-            name=mp_keypoint.name
-        )
+        # Convert keypoints to numpy arrays for vectorized operations
+        mp_array = np.array([
+            [kp.x, kp.y, kp.confidence] for kp in mediapipe_keypoints
+        ])
+        mn_array = np.array([
+            [kp.x, kp.y, kp.confidence] for kp in movenet_keypoints
+        ])
+
+        # Calculate weighted average using broadcasting
+        weights = np.array([self.mediapipe_weight, self.movenet_weight])
+        stacked_arrays = np.stack([mp_array, mn_array], axis=-1)
+        fused_array = np.sum(stacked_arrays * weights, axis=-1) / np.sum(weights)
+
+        # Create fused keypoints with numpy operations
+        fused_keypoints = []
+        for i, (pos, mp_kp) in enumerate(zip(fused_array, mediapipe_keypoints)):
+            confidence = pos[2]
+            if confidence >= self.confidence_threshold:
+                fused_keypoints.append(
+                    Keypoint(
+                        x=pos[0],
+                        y=pos[1],
+                        confidence=confidence,
+                        name=mp_kp.name
+                    )
+                )
+
+        # Cache results for temporal consistency
+        cache_key = hash(tuple(fused_array.flatten()))
+        self.keypoint_cache[cache_key] = fused_keypoints
+        if len(self.keypoint_cache) > self.max_cache_size:
+            self.keypoint_cache.pop(next(iter(self.keypoint_cache)))
+
+        return fused_keypoints if fused_keypoints else None
 
     def _adjust_confidence(
         self,
         keypoints: List[Keypoint],
         factor: float
     ) -> List[Keypoint]:
-        """Adjust confidence values by a factor"""
+        """Adjust confidence scores using vectorized operations"""
+        if not keypoints:
+            return []
+            
+        # Convert to numpy array for vectorized operations
+        kp_array = np.array([
+            [kp.x, kp.y, kp.confidence] for kp in keypoints
+        ])
+        
+        # Adjust confidences
+        kp_array[:, 2] *= factor
+        
+        # Filter and convert back to keypoints
+        mask = kp_array[:, 2] >= self.confidence_threshold
         return [
             Keypoint(
-                x=kp.x,
-                y=kp.y,
-                confidence=kp.confidence * factor,
-                name=kp.name
+                x=pos[0],
+                y=pos[1],
+                confidence=pos[2],
+                name=keypoints[i].name
             )
-            for kp in keypoints
+            for i, pos in enumerate(kp_array[mask])
         ]

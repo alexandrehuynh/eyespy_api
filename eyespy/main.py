@@ -5,7 +5,7 @@ from .models import PoseEstimationResponse, ProcessingStatus, ConfidenceMetrics,
 from .video import VideoProcessor
 from .pose.mediapipe_estimator import MediaPipeEstimator
 from .pose.movenet_estimator import MovenetEstimator
-from .pose.pose_fusion import PoseFusion
+from .pose.fusion import PoseFusion
 import time
 from typing import Optional, Dict, List
 import psutil

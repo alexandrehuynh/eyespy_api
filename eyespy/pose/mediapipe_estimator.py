@@ -59,40 +59,22 @@ class MediaPipeEstimator:
         if batch_size is None:
             batch_size = self.batch_size
             
-        all_keypoints = []
         total_frames = len(frames)
+        tasks = []
         
-        # Process in optimized batches
+        # Create all tasks at once instead of processing sequentially
         for i in range(0, total_frames, batch_size):
-            batch_start = time.time()
-            
-            # Get current batch
             batch = frames[i:i + batch_size]
-            
-            try:
-                # Process batch
-                batch_keypoints = await self._process_mediapipe_batch(batch)
-                all_keypoints.extend(batch_keypoints)
-                
-                # Record performance
-                batch_time = time.time() - batch_start
-                self.processing_times.append(batch_time)
-                
-                # Log performance
-                fps = len(batch) / batch_time
-                logger.info(
-                    f"MediaPipe Batch {i//batch_size}: "
-                    f"Processed {len(batch)} frames at {fps:.1f} FPS"
-                )
-                
-            except Exception as e:
-                logger.error(f"Error in MediaPipe batch {i//batch_size}: {str(e)}")
-                # Continue with next batch instead of failing completely
-                continue
-            
-            # Allow other tasks to run
-            await asyncio.sleep(0)
-            
+            tasks.append(self._process_mediapipe_batch(batch))
+        
+        # Process all batches concurrently
+        results = await asyncio.gather(*tasks)
+        
+        # Flatten results
+        all_keypoints = []
+        for batch_keypoints in results:
+            all_keypoints.extend(batch_keypoints)
+        
         return all_keypoints
 
     async def _process_mediapipe_batch(
