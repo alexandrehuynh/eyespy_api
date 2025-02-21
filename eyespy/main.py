@@ -12,6 +12,7 @@ import psutil
 import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -127,16 +128,31 @@ async def process_video(
                 "frames_processed": processed_frames,
                 "average_fps": avg_fps,
                 "average_batch_time": avg_batch_time,
-                "average_memory_usage": avg_memory
-            }
+                "average_memory_usage": avg_memory,
+                "video_info": {
+                    "original_fps": chunk_metadata.get("original_fps", 0),
+                    "total_frames": chunk_metadata.get("total_frames", 0),
+                    "duration": chunk_metadata.get("duration", 0)
+                }
+            },
+            confidence_metrics={
+                "average_confidence": np.mean([kp.confidence for kp in fused_results]) if fused_results else 0.0,
+                "keypoints": {
+                    "processed": processed_frames,
+                    "detected": len([k for k in fused_results if k is not None]) if fused_results else 0
+                }
+            },
+            validation_metrics=pose_estimator.frame_metadata,
+            error="No frames processed successfully" if processed_frames == 0 else None
         )
 
     except Exception as e:
-        logger.error(f"Error processing video: {str(e)}")
         return PoseEstimationResponse(
             status="failed",
             keypoints=None,
             metadata={"processing_time": time.time() - processing_start},
+            confidence_metrics={"average_confidence": 0.0, "keypoints": {}},
+            validation_metrics={},
             error=str(e)
         )
     finally:
