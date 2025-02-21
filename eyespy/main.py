@@ -46,7 +46,8 @@ async def process_video(
     processed_frames = 0
     batch_times = []
     memory_usage = []
-    metadata = {}  # Initialize metadata dictionary
+    metadata = {}
+    fused_results = []  # Initialize fused_results list
     
     try:
         video_processor = VideoProcessor(batch_size=batch_size)
@@ -67,10 +68,9 @@ async def process_video(
             if not frames_chunk:
                 continue
                 
-            metadata = chunk_metadata  # Store the metadata
+            metadata = chunk_metadata
             batch_start = time.time()
             
-            # Process chunk with both models in parallel
             try:
                 # Run both models concurrently
                 mediapipe_task = pose_estimator.process_frames(frames_chunk)
@@ -82,13 +82,15 @@ async def process_video(
                 )
                 
                 # Fuse results for each frame in the chunk
-                fused_results = []
+                batch_results = []
                 for mp_kp, mn_kp in zip(mp_keypoints, mn_keypoints):
                     fused_kp = await pose_fusion.fuse_predictions(mp_kp, mn_kp)
-                    fused_results.append(fused_kp)
+                    batch_results.append(fused_kp)
                 
-                # Update metrics safely
-                processed_frames += len(fused_results)
+                fused_results.extend(batch_results)  # Add batch results to overall results
+                
+                # Update metrics
+                processed_frames += len(batch_results)
                 batch_time = time.time() - batch_start
                 batch_times.append(batch_time)
                 memory_usage.append(psutil.Process().memory_percent())
@@ -106,8 +108,8 @@ async def process_video(
                 del mp_keypoints
                 del mn_keypoints
                 
-            except Exception as batch_error:
-                logger.error(f"Error processing batch: {str(batch_error)}")
+            except Exception as e:
+                logger.error(f"Error processing batch: {str(e)}")
                 continue
             
             # Optional: Add delay if memory usage is too high

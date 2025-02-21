@@ -101,6 +101,9 @@ class VideoProcessor:
                     self._quality_assessor(frame_buffer, result_buffer)
                 )
                 
+                logger.info(f"Frame reader started, buffer size: {frame_buffer.qsize()}")
+                logger.info(f"Quality assessor started")
+                
                 try:
                     while True:
                         result_data = await result_buffer.get()
@@ -219,7 +222,7 @@ class VideoProcessor:
             return [], {}
 
     async def _quality_assessor(self, frame_buffer: asyncio.Queue, result_buffer: asyncio.Queue):
-        """Process frames for quality with proper async handling"""
+        """Process frames for quality assessment"""
         try:
             while True:
                 batch_data = await frame_buffer.get()
@@ -229,17 +232,19 @@ class VideoProcessor:
                 if not isinstance(batch_data, dict) or 'frame' not in batch_data:
                     logger.error(f"Invalid batch data format: {batch_data}")
                     continue
-                    
-                # Process single frame (changed from batch_data['frames'])
-                frame_metrics = await self._process_batch([batch_data['frame']])
+                
+                # Process single frame
+                frame_metrics = await self.quality_assessor.assess_frame(batch_data['frame'])
                 
                 # Add quality results to result buffer
                 await result_buffer.put({
                     'frames': [batch_data['frame']],
-                    'indices': [batch_data['index']],
-                    'metrics': frame_metrics
+                    'metrics': [frame_metrics],
+                    'indices': [batch_data['index']]
                 })
                 
+        except Exception as e:
+            logger.error(f"Error in quality assessor: {str(e)}")
         finally:
             await result_buffer.put(None)
 
@@ -289,19 +294,29 @@ class VideoProcessor:
 
     async def _get_video_properties(self, cap: cv2.VideoCapture) -> Dict:
         """Get video properties with optimized settings"""
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        duration = total_frames / fps if fps > 0 else 0
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        
+        # Validate video properties
+        if fps <= 0 or total_frames <= 0 or width <= 0 or height <= 0:
+            logger.error(f"Invalid video properties: fps={fps}, frames={total_frames}, dimensions={width}x{height}")
+            raise ValueError("Invalid video properties detected")
+        
+        fps = int(fps)
+        total_frames = int(total_frames)
+        width = int(width)
+        height = int(height)
+        duration = total_frames / fps
 
         # Target settings for processing efficiency
-        target_fps = min(30, fps)  # Don't exceed original FPS
-        target_height = 720  # Resize for processing efficiency
+        target_fps = min(30, fps)
+        target_height = 720
         target_width = int(width * (target_height / height))
-
-        # Calculate frame sampling to maintain smooth motion
         sample_interval = max(1, int(fps / target_fps))
+
+        logger.info(f"Video properties: fps={cap.get(cv2.CAP_PROP_FPS)}, frames={cap.get(cv2.CAP_PROP_FRAME_COUNT)}")
 
         return {
             'original_fps': fps,
