@@ -43,16 +43,18 @@ async def process_video(
     batch_size: int = 50
 ) -> PoseEstimationResponse:
     processing_start = time.time()
-    video_processor = VideoProcessor(batch_size=batch_size)
-    pose_estimator = MediaPipeEstimator()
-    movenet_estimator = MovenetEstimator()
-    pose_fusion = PoseFusion()
-    
     processed_frames = 0
     batch_times = []
     memory_usage = []
+    metadata = {}  # Initialize metadata dictionary
     
     try:
+        video_processor = VideoProcessor(batch_size=batch_size)
+        pose_estimator = MediaPipeEstimator()
+        movenet_estimator = MovenetEstimator()
+        pose_fusion = PoseFusion()
+        
+        # Save uploaded video
         video_path = await video_processor.save_upload(video)
         if not video_path:
             raise HTTPException(status_code=400, detail="Unable to save video")
@@ -64,7 +66,8 @@ async def process_video(
         ):
             if not frames_chunk:
                 continue
-            
+                
+            metadata = chunk_metadata  # Store the metadata
             batch_start = time.time()
             
             # Process chunk with both models in parallel
@@ -130,9 +133,9 @@ async def process_video(
                 "average_batch_time": avg_batch_time,
                 "average_memory_usage": avg_memory,
                 "video_info": {
-                    "original_fps": chunk_metadata.get("original_fps", 0),
-                    "total_frames": chunk_metadata.get("total_frames", 0),
-                    "duration": chunk_metadata.get("duration", 0)
+                    "original_fps": metadata.get("original_fps", 0),
+                    "total_frames": metadata.get("total_frames", 0),
+                    "duration": metadata.get("duration", 0)
                 }
             },
             confidence_metrics={
@@ -147,6 +150,7 @@ async def process_video(
         )
 
     except Exception as e:
+        logger.error(f"Error processing video: {str(e)}")
         return PoseEstimationResponse(
             status="failed",
             keypoints=None,
