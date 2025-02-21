@@ -47,7 +47,9 @@ async def process_video(
     batch_times = []
     memory_usage = []
     metadata = {}
-    fused_results = []  # Initialize fused_results list
+    fused_results = []
+    
+    logger.info(f"Starting video processing with target_fps={target_fps}, batch_size={batch_size}")
     
     try:
         video_processor = VideoProcessor(batch_size=batch_size)
@@ -58,7 +60,10 @@ async def process_video(
         # Save uploaded video
         video_path = await video_processor.save_upload(video)
         if not video_path:
+            logger.error("Failed to save uploaded video")
             raise HTTPException(status_code=400, detail="Unable to save video")
+            
+        logger.info(f"Video saved to: {video_path}")
         
         # Process frames in streaming mode
         async for frames_chunk, chunk_metadata in video_processor.extract_frames(
@@ -66,12 +71,14 @@ async def process_video(
             target_fps=target_fps
         ):
             if not frames_chunk:
+                logger.debug("Empty frames chunk received")
                 continue
                 
             metadata = chunk_metadata
             batch_start = time.time()
             
             try:
+                logger.debug(f"Processing batch of {len(frames_chunk)} frames")
                 # Run both models concurrently
                 mediapipe_task = pose_estimator.process_frames(frames_chunk)
                 movenet_task = movenet_estimator.process_frames(frames_chunk)
@@ -80,6 +87,9 @@ async def process_video(
                     mediapipe_task,
                     movenet_task
                 )
+                
+                logger.debug(f"MediaPipe detected: {len([k for k in mp_keypoints if k is not None])} poses")
+                logger.debug(f"MoveNet detected: {len([k for k in mn_keypoints if k is not None])} poses")
                 
                 # Fuse results for each frame in the chunk
                 batch_results = []

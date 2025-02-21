@@ -155,14 +155,18 @@ class VideoProcessor:
         """Read frames from video and put them in buffer"""
         try:
             frame_count = 0
+            logger.info("Starting frame reader...")
+            
             while cap.isOpened():
                 ret, frame = await asyncio.get_event_loop().run_in_executor(
                     executor, cap.read
                 )
                 if not ret:
+                    logger.info(f"Frame reading complete. Total frames read: {frame_count}")
                     break
                 
                 if frame_count % metadata['frame_interval'] == 0:
+                    logger.debug(f"Reading frame {frame_count}, shape: {frame.shape}")
                     await frame_buffer.put({
                         'frame': frame,
                         'index': frame_count
@@ -170,6 +174,7 @@ class VideoProcessor:
                 
                 frame_count += 1
                 
+            logger.info(f"Frame reader finished. Total frames processed: {frame_count}")
             # Signal end of processing
             await frame_buffer.put(None)
             
@@ -224,24 +229,46 @@ class VideoProcessor:
     async def _quality_assessor(self, frame_buffer: asyncio.Queue, result_buffer: asyncio.Queue):
         """Process frames for quality assessment"""
         try:
+            frames_processed = 0
+            frames_passed = 0
+            logger.info("Starting quality assessor...")
+            
             while True:
                 batch_data = await frame_buffer.get()
                 if batch_data is None:
+                    logger.info(f"Quality assessment complete. Processed: {frames_processed}, Passed: {frames_passed}")
                     break
                 
                 if not isinstance(batch_data, dict) or 'frame' not in batch_data:
                     logger.error(f"Invalid batch data format: {batch_data}")
                     continue
                 
+                frames_processed += 1
                 # Process single frame
                 frame_metrics = await self.quality_assessor.assess_frame(batch_data['frame'])
                 
-                # Add quality results to result buffer
-                await result_buffer.put({
-                    'frames': [batch_data['frame']],
-                    'metrics': [frame_metrics],
-                    'indices': [batch_data['index']]
-                })
+                # Detailed metrics logging
+                logger.info(f"""
+Frame {batch_data['index']} Quality Metrics:
+- Valid: {frame_metrics.is_valid}
+- Overall Score: {frame_metrics.overall_score:.3f} (threshold: {self.min_quality_threshold})
+- Brightness: {frame_metrics.brightness:.3f}
+- Contrast: {frame_metrics.contrast:.3f}
+- Blur Score: {frame_metrics.blur_score:.3f}
+- Coverage Score: {frame_metrics.coverage_score:.3f}
+                """)
+                
+                if frame_metrics.is_valid and frame_metrics.overall_score >= self.min_quality_threshold:
+                    frames_passed += 1
+                    logger.info(f"✅ Frame {batch_data['index']} PASSED quality check")
+                    await result_buffer.put({
+                        'frames': [batch_data['frame']],
+                        'metrics': [frame_metrics],
+                        'indices': [batch_data['index']]
+                    })
+                else:
+                    failure_reason = "invalid frame" if not frame_metrics.is_valid else f"low score ({frame_metrics.overall_score:.3f} < {self.min_quality_threshold})"
+                    logger.warning(f"❌ Frame {batch_data['index']} FAILED quality check: {failure_reason}")
                 
         except Exception as e:
             logger.error(f"Error in quality assessor: {str(e)}")
