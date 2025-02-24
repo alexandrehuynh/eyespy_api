@@ -60,6 +60,44 @@ class VideoProcessor:
         self.temp_dir = Path(settings.TEMP_DIR)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.quality_assessor = AdaptiveFrameQualityAssessor()
+        self._cleanup_handlers_registered = False
+        self.active_tasks = set()  # Track active tasks
+
+    async def cleanup_resources(self):
+        """Cleanup all resources"""
+        logger.info("Cleaning up resources...")
+        
+        # Cancel all active tasks
+        for task in self.active_tasks:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        
+        # Clear the set
+        self.active_tasks.clear()
+        
+        # Cleanup temporary files
+        if self.temp_dir.exists():
+            for temp_file in self.temp_dir.glob("temp_*"):
+                try:
+                    temp_file.unlink()
+                    logger.debug(f"Removed temporary file: {temp_file}")
+                except Exception as e:
+                    logger.error(f"Error removing temporary file {temp_file}: {e}")
+
+        # Release other resources
+        if hasattr(self, 'quality_assessor'):
+            self.quality_assessor.__del__()
+        
+        logger.info("Cleanup completed")
+
+    def __del__(self):
+        """Ensure cleanup on deletion"""
+        if asyncio.get_event_loop().is_running():
+            asyncio.create_task(self.cleanup_resources())
 
     async def extract_frames(
         self,
@@ -67,33 +105,20 @@ class VideoProcessor:
         target_fps: Optional[int] = None,
         max_duration: Optional[int] = None
     ) -> AsyncGenerator[Tuple[List[np.ndarray], dict], None]:
-        """Extract frames using parallel processing with streaming"""
+        """Extract frames with performance optimization"""
         if not video_path.exists():
             yield [], self._create_error_metadata("Video file not found")
             return
 
         cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            yield [], self._create_error_metadata("Failed to open video file")
-            return
-
         try:
             metadata = await self._get_video_properties(cap)
-            if metadata["total_frames"] == 0:
-                yield [], self._create_error_metadata("Video appears to be empty")
-                return
-
-            metadata.update({
-                "target_fps": target_fps or metadata['original_fps'],
-                "frame_interval": max(1, metadata["original_fps"] // (target_fps or metadata['original_fps']))
-            })
-
-            # Use ThreadPoolExecutor for frame reading
+            frame_buffer = asyncio.Queue(maxsize=self.buffer_size)
+            result_buffer = asyncio.Queue(maxsize=self.buffer_size)
+            
+            # Use ThreadPoolExecutor for CPU-bound operations
             with ThreadPoolExecutor(max_workers=4) as executor:
-                frame_buffer = asyncio.Queue(maxsize=self.buffer_size)
-                result_buffer = asyncio.Queue(maxsize=self.buffer_size)
-                
-                # Start frame reader and quality assessment tasks
+                # Start frame reader and quality assessor tasks
                 reader_task = asyncio.create_task(
                     self._frame_reader(cap, frame_buffer, executor, metadata)
                 )
@@ -101,35 +126,26 @@ class VideoProcessor:
                     self._quality_assessor(frame_buffer, result_buffer)
                 )
                 
-                logger.info(f"Frame reader started, buffer size: {frame_buffer.qsize()}")
-                logger.info(f"Quality assessor started")
-                
                 try:
                     while True:
                         result_data = await result_buffer.get()
                         if result_data is None:
                             break
                         
-                        # Process frames in batches
+                        # Process frames efficiently
                         frames = result_data['frames']
-                        metrics = result_data['metrics']
+                        if not frames:
+                            continue
+                            
+                        # Use numpy operations for better performance
+                        frames_array = np.array(frames)
+                        yield frames_array.tolist(), {
+                            **metadata,
+                            "frames_processed": len(frames),
+                            "quality_metrics": self._calculate_quality_stats(result_data['metrics'])
+                        }
                         
-                        # Filter quality frames using numpy operations
-                        quality_mask = np.array([
-                            m.is_valid and m.overall_score >= self.min_quality_threshold
-                            for m in metrics
-                        ])
-                        quality_frames = np.array(frames)[quality_mask]
-                        
-                        if len(quality_frames) > 0:
-                            yield quality_frames.tolist(), {
-                                **metadata,
-                                "frames_processed": len(quality_frames),
-                                "quality_metrics": self._calculate_quality_stats(
-                                    [m for i, m in enumerate(metrics) if quality_mask[i]]
-                                )
-                            }
-                        
+                        # Allow other tasks to run
                         await asyncio.sleep(0)
                         
                 finally:
@@ -141,7 +157,6 @@ class VideoProcessor:
                                 await task
                             except asyncio.CancelledError:
                                 pass
-                
         finally:
             cap.release()
 
@@ -157,29 +172,58 @@ class VideoProcessor:
             frame_count = 0
             logger.info("Starting frame reader...")
             
+            # Get video properties
+            fps = metadata.get('fps', 30.0)
+            target_fps = metadata.get('target_fps', 30.0)
+            frame_interval = metadata.get('frame_interval', 1)
+            
+            logger.info(f"Video properties: FPS={fps}, Target FPS={target_fps}, Frame Interval={frame_interval}")
+            
             while cap.isOpened():
                 ret, frame = await asyncio.get_event_loop().run_in_executor(
                     executor, cap.read
                 )
+                
                 if not ret:
                     logger.info(f"Frame reading complete. Total frames read: {frame_count}")
                     break
                 
-                if frame_count % metadata['frame_interval'] == 0:
-                    logger.debug(f"Reading frame {frame_count}, shape: {frame.shape}")
-                    await frame_buffer.put({
-                        'frame': frame,
-                        'index': frame_count
-                    })
+                # Process frames at target FPS
+                if frame_count % frame_interval == 0:
+                    if frame is not None and isinstance(frame, np.ndarray):
+                        # Log frame properties
+                        logger.debug(f"Reading frame {frame_count}, shape: {frame.shape}, type: {frame.dtype}")
+                        
+                        # Ensure frame is in correct format
+                        if frame.dtype != np.uint8:
+                            frame = frame.astype(np.uint8)
+                        
+                        # Handle different color spaces
+                        if len(frame.shape) == 2:  # Grayscale
+                            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                        elif frame.shape[2] == 4:  # RGBA
+                            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                        
+                        await frame_buffer.put({
+                            'frame': frame.copy(),  # Create a copy to prevent reference issues
+                            'index': frame_count,
+                            'timestamp': frame_count / fps if fps > 0 else 0
+                        })
+                    else:
+                        logger.warning(f"Invalid frame at index {frame_count}")
                 
                 frame_count += 1
                 
+                # Periodically yield control to other tasks
+                if frame_count % 10 == 0:
+                    await asyncio.sleep(0)
+            
             logger.info(f"Frame reader finished. Total frames processed: {frame_count}")
-            # Signal end of processing
-            await frame_buffer.put(None)
             
         except Exception as e:
             logger.error(f"Error in frame reader: {str(e)}")
+        finally:
+            # Signal end of processing
             await frame_buffer.put(None)
 
     async def _process_batch(self, frames: List[np.ndarray]) -> List[QualityMetrics]:
@@ -320,41 +364,39 @@ Frame {batch_data['index']} Quality Metrics:
             return None
 
     async def _get_video_properties(self, cap: cv2.VideoCapture) -> Dict:
-        """Get video properties with optimized settings"""
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        
-        # Validate video properties
-        if fps <= 0 or total_frames <= 0 or width <= 0 or height <= 0:
-            logger.error(f"Invalid video properties: fps={fps}, frames={total_frames}, dimensions={width}x{height}")
-            raise ValueError("Invalid video properties detected")
-        
-        fps = int(fps)
-        total_frames = int(total_frames)
-        width = int(width)
-        height = int(height)
-        duration = total_frames / fps
-
-        # Target settings for processing efficiency
-        target_fps = min(30, fps)
-        target_height = 720
-        target_width = int(width * (target_height / height))
-        sample_interval = max(1, int(fps / target_fps))
-
-        logger.info(f"Video properties: fps={cap.get(cv2.CAP_PROP_FPS)}, frames={cap.get(cv2.CAP_PROP_FRAME_COUNT)}")
-
-        return {
-            'original_fps': fps,
-            'total_frames': total_frames,
-            'original_dimensions': (height, width),
-            'target_dimensions': (target_height, target_width),
-            'duration': duration,
-            'sample_interval': sample_interval,
-            'target_fps': target_fps,
-            'resize_factor': target_height / height
-        }
+        """Get video properties with frame interval calculation"""
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
+            
+            # Calculate frame interval based on target FPS
+            original_fps = fps if fps > 0 else 30.0
+            target_fps = self.target_fps if hasattr(self, 'target_fps') else 30.0
+            frame_interval = max(1, int(original_fps / target_fps))
+            
+            metadata = {
+                "fps": fps,
+                "total_frames": total_frames,
+                "duration": duration,
+                "frame_interval": frame_interval,
+                "original_fps": fps,
+                "target_fps": target_fps
+            }
+            
+            logger.info(f"Video properties: fps={fps}, frames={total_frames}")
+            return metadata
+            
+        except Exception as e:
+            logger.error(f"Error getting video properties: {str(e)}")
+            return {
+                "fps": 0,
+                "total_frames": 0,
+                "duration": 0,
+                "frame_interval": 1,
+                "original_fps": 0,
+                "target_fps": 30.0
+            }
 
     async def _process_frames(
         self,

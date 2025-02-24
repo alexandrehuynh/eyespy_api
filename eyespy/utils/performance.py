@@ -46,33 +46,78 @@ class PerformanceMetrics:
             "total_time_seconds": self.total_time
         }
 
+@dataclass
+class PerformanceConfig:
+    max_memory_percent: float = 80.0
+    target_fps: float = 30.0
+    batch_size_min: int = 10
+    batch_size_max: int = 100
+    cpu_threshold: float = 90.0
+    adaptive_batch_size: bool = True
+
 class PerformanceMonitor:
-    def __init__(self):
-        self.batch_times: List[float] = []
-        self.memory_usage: List[float] = []
-        self.fps_values: List[float] = []
+    def __init__(self, config: Optional[PerformanceConfig] = None):
+        self.config = config or PerformanceConfig()
+        self.process = psutil.Process()
         self.start_time = time.time()
-        self.total_frames = 0
+        self.frames_processed = 0
+        self.current_batch_size = self.config.batch_size_min
+        self._last_adjustment = time.time()
         
-    def record_batch(self, batch_size: int, batch_time: float):
-        self.batch_times.append(batch_time)
-        self.memory_usage.append(psutil.Process().memory_percent())
-        self.fps_values.append(batch_size / batch_time)
-        self.total_frames += batch_size
+    async def check_resources(self) -> Dict:
+        """Check system resources and adjust processing parameters"""
+        cpu_percent = psutil.cpu_percent()
+        memory_percent = self.process.memory_percent()
         
-    def get_metrics(self) -> PerformanceMetrics:
-        return PerformanceMetrics(
-            batch_times=self.batch_times,
-            memory_usage=self.memory_usage,
-            fps_values=self.fps_values,
-            total_frames=self.total_frames,
-            total_time=time.time() - self.start_time
-        )
+        metrics = {
+            'cpu_usage': cpu_percent,
+            'memory_usage': memory_percent,
+            'batch_size': self.current_batch_size,
+            'fps': self.get_current_fps()
+        }
+        
+        # Log if resources are strained
+        if cpu_percent > self.config.cpu_threshold:
+            logger.warning(f"High CPU usage: {cpu_percent}%")
+        if memory_percent > self.config.max_memory_percent:
+            logger.warning(f"High memory usage: {memory_percent}%")
+            
+        # Adjust batch size if needed
+        if self.config.adaptive_batch_size:
+            await self._adjust_batch_size(cpu_percent, memory_percent)
+            
+        return metrics
     
-    def log_batch_metrics(self, batch_index: int):
-        logger.info(
-            f"Batch {batch_index}: "
-            f"FPS: {self.fps_values[-1]:.1f}, "
-            f"Memory: {self.memory_usage[-1]:.1f}%, "
-            f"Time: {self.batch_times[-1]:.3f}s"
-        ) 
+    async def _adjust_batch_size(self, cpu_percent: float, memory_percent: float):
+        """Dynamically adjust batch size based on system load"""
+        now = time.time()
+        # Only adjust every 5 seconds
+        if now - self._last_adjustment < 5:
+            return
+            
+        self._last_adjustment = now
+        
+        # Decrease batch size if resources are strained
+        if cpu_percent > self.config.cpu_threshold or memory_percent > self.config.max_memory_percent:
+            self.current_batch_size = max(
+                self.config.batch_size_min,
+                int(self.current_batch_size * 0.8)
+            )
+            logger.info(f"Decreased batch size to {self.current_batch_size}")
+            
+        # Increase batch size if resources are available
+        elif cpu_percent < self.config.cpu_threshold * 0.7 and memory_percent < self.config.max_memory_percent * 0.7:
+            self.current_batch_size = min(
+                self.config.batch_size_max,
+                int(self.current_batch_size * 1.2)
+            )
+            logger.info(f"Increased batch size to {self.current_batch_size}")
+    
+    def get_current_fps(self) -> float:
+        """Calculate current FPS"""
+        elapsed_time = time.time() - self.start_time
+        return self.frames_processed / elapsed_time if elapsed_time > 0 else 0
+    
+    def frame_processed(self):
+        """Call this when a frame is processed"""
+        self.frames_processed += 1 

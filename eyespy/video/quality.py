@@ -5,27 +5,28 @@ from typing import Dict, List, Optional, Tuple
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 @dataclass
 class QualityThresholds:
     # Brightness thresholds (0-1)
-    min_brightness: float = 0.15    # Dark but still visible
-    max_brightness: float = 0.85    # Bright but not overexposed
-    optimal_brightness: float = 0.5  # Ideal brightness
+    min_brightness: float = 0.1  # Was higher
+    max_brightness: float = 0.9
+    optimal_brightness: float = 0.5
     
     # Contrast thresholds (0-1)
-    min_contrast: float = 0.15      # Minimum acceptable contrast
-    optimal_contrast: float = 0.4    # Ideal contrast
+    min_contrast: float = 0.1  # Was higher
+    optimal_contrast: float = 0.5
     
     # Blur thresholds
-    min_blur_score: float = 50      # Minimum Laplacian variance
-    optimal_blur_score: float = 150  # Ideal sharpness
+    min_blur_score: float = 10.0  # Was much higher, lowering to match actual video quality
+    optimal_blur_score: float = 50.0
     
     # Coverage thresholds (0-1)
-    min_coverage: float = 0.15      # Minimum subject coverage
-    optimal_coverage: float = 0.4    # Ideal subject coverage
+    min_coverage: float = 0.1
+    optimal_coverage: float = 0.8
     
     # Overall quality threshold
     min_overall_score: float = 0.5   # Minimum acceptable overall quality
@@ -145,23 +146,30 @@ class AdaptiveFrameQualityAssessor:
         return np.count_nonzero(thresh) / thresh.size
 
     def _calculate_overall_score(self, brightness: float, contrast: float, blur: float, coverage: float) -> float:
-        """Calculate overall quality score"""
+        """Calculate overall quality score with adjusted weights"""
         # Normalize blur score (higher is better)
-        norm_blur = min(1.0, blur / 1000.0)  # Adjust divisor based on your needs
+        norm_blur = min(1.0, blur / self.thresholds.optimal_blur_score)
         
-        # Weighted average of all metrics
+        # Adjusted weights to be more lenient
         weights = {
-            'brightness': 0.25,
-            'contrast': 0.25,
-            'blur': 0.25,
-            'coverage': 0.25
+            'brightness': 0.2,
+            'contrast': 0.2,
+            'blur': 0.3,      # Increased weight for blur
+            'coverage': 0.3   # Increased weight for coverage
         }
         
+        # Calculate individual scores
+        brightness_score = 1 - abs(brightness - self.thresholds.optimal_brightness) * 2
+        contrast_score = contrast / self.thresholds.optimal_contrast
+        blur_score = norm_blur
+        coverage_score = coverage / self.thresholds.optimal_coverage
+        
+        # Calculate weighted average
         score = (
-            weights['brightness'] * (1 - abs(brightness - 0.5) * 2) +  # Closer to 0.5 is better
-            weights['contrast'] * contrast +
-            weights['blur'] * norm_blur +
-            weights['coverage'] * coverage
+            weights['brightness'] * brightness_score +
+            weights['contrast'] * contrast_score +
+            weights['blur'] * blur_score +
+            weights['coverage'] * coverage_score
         )
         
         return max(0.0, min(1.0, score))
@@ -169,6 +177,28 @@ class AdaptiveFrameQualityAssessor:
     async def assess_frame(self, frame: np.ndarray) -> QualityMetrics:
         """Assess frame quality with detailed logging"""
         try:
+            # Validate frame
+            if frame is None:
+                logger.error("Received None frame")
+                return self._create_invalid_metrics("Frame is None")
+            
+            if not isinstance(frame, np.ndarray):
+                logger.error(f"Invalid frame type: {type(frame)}")
+                return self._create_invalid_metrics(f"Invalid frame type: {type(frame)}")
+            
+            if len(frame.shape) != 3:
+                logger.error(f"Invalid frame dimensions: {frame.shape}")
+                return self._create_invalid_metrics(f"Invalid frame dimensions: {frame.shape}")
+            
+            if frame.shape[2] != 3:  # Check if frame is BGR
+                logger.error(f"Invalid color channels: {frame.shape[2]}")
+                return self._create_invalid_metrics(f"Invalid color channels: {frame.shape[2]}")
+
+            # Ensure frame is in uint8 format
+            if frame.dtype != np.uint8:
+                logger.warning(f"Converting frame from {frame.dtype} to uint8")
+                frame = frame.astype(np.uint8)
+
             # Log frame properties
             logger.debug(f"Assessing frame: shape={frame.shape}, dtype={frame.dtype}")
             
@@ -226,15 +256,22 @@ Frame failed quality thresholds:
             
         except Exception as e:
             logger.error(f"Error assessing frame quality: {str(e)}")
-            return QualityMetrics(
-                is_valid=False,
-                brightness=0.0,
-                contrast=0.0,
-                blur_score=0.0,
-                coverage_score=0.0,
-                overall_score=0.0,
-                details={}
-            )
+            return self._create_invalid_metrics(str(e))
+
+    def _create_invalid_metrics(self, error_message: str) -> QualityMetrics:
+        """Create metrics object for invalid frames"""
+        return QualityMetrics(
+            is_valid=False,
+            brightness=0.0,
+            contrast=0.0,
+            blur_score=0.0,
+            coverage_score=0.0,
+            overall_score=0.0,
+            details={
+                'error': error_message,
+                'timestamp': time.time()
+            }
+        )
 
     def __del__(self):
         """Cleanup executor on deletion"""

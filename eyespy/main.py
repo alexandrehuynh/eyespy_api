@@ -13,6 +13,7 @@ import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+from .utils.performance import PerformanceConfig, PerformanceMonitor
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -40,7 +41,8 @@ async def process_video(
     video: UploadFile = File(...),
     target_fps: Optional[int] = None,
     max_duration: Optional[int] = None,
-    batch_size: int = 50
+    batch_size: int = 50,
+    performance_mode: str = "balanced"  # ["fast", "balanced", "quality"]
 ) -> PoseEstimationResponse:
     processing_start = time.time()
     processed_frames = 0
@@ -48,6 +50,16 @@ async def process_video(
     memory_usage = []
     metadata = {}
     fused_results = []
+    
+    # Initialize performance monitor with mode-specific settings
+    perf_config = PerformanceConfig(
+        max_memory_percent=80.0 if performance_mode == "fast" else 90.0,
+        target_fps=30.0 if performance_mode == "fast" else 20.0,
+        batch_size_min=10,
+        batch_size_max=100 if performance_mode == "fast" else 50,
+        adaptive_batch_size=True
+    )
+    perf_monitor = PerformanceMonitor(perf_config)
     
     logger.info(f"Starting video processing with target_fps={target_fps}, batch_size={batch_size}")
     
@@ -77,6 +89,15 @@ async def process_video(
             metadata = chunk_metadata
             batch_start = time.time()
             
+            # Check system resources
+            perf_metrics = await perf_monitor.check_resources()
+            if perf_metrics['memory_usage'] > perf_config.max_memory_percent:
+                logger.warning("High memory usage detected, adding delay")
+                await asyncio.sleep(0.1)
+            
+            # Update batch size dynamically
+            video_processor.batch_size = perf_monitor.current_batch_size
+            
             try:
                 logger.debug(f"Processing batch of {len(frames_chunk)} frames")
                 # Run both models concurrently
@@ -101,6 +122,7 @@ async def process_video(
                 
                 # Update metrics
                 processed_frames += len(batch_results)
+                perf_monitor.frames_processed += len(frames_chunk)
                 batch_time = time.time() - batch_start
                 batch_times.append(batch_time)
                 memory_usage.append(psutil.Process().memory_percent())
@@ -122,18 +144,21 @@ async def process_video(
                 logger.error(f"Error processing batch: {str(e)}")
                 continue
             
-            # Optional: Add delay if memory usage is too high
-            if memory_usage[-1] > 80:  # Arbitrary threshold
-                logger.warning("High memory usage detected, adding small delay")
-                await asyncio.sleep(0.1)
-        
         # Calculate final metrics safely
         total_time = time.time() - processing_start
         avg_fps = processed_frames / total_time if total_time > 0 else 0
         avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
         avg_memory = sum(memory_usage) / len(memory_usage) if memory_usage else 0
         
+        # Final performance report
+        final_metrics = await perf_monitor.check_resources()
+        logger.info(f"Final performance metrics: {final_metrics}")
         logger.info(f"Processing complete. Metrics: {avg_fps:.1f} FPS, {avg_batch_time:.3f} seconds per batch, {avg_memory:.1f}% memory usage")
+        
+        # Add this to your code for monitoring
+        process = psutil.Process()
+        memory_percent = process.memory_percent()
+        logger.info(f"Memory usage: {memory_percent}%")
         
         return PoseEstimationResponse(
             status="success" if processed_frames > 0 else "failed",
@@ -172,6 +197,13 @@ async def process_video(
             error=str(e)
         )
     finally:
-        # Cleanup
-        if video_path:
-            await video_processor.cleanup(video_path)
+        if video_processor:
+            await video_processor.cleanup_resources()
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        # Log memory usage
+        process = psutil.Process()
+        logger.info(f"Final memory usage: {process.memory_percent()}%")
