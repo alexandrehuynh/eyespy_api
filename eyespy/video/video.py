@@ -50,17 +50,17 @@ class VideoProcessor:
         self,
         batch_size: int = 50,
         buffer_size: int = 100,
-        min_quality_threshold: float = 0.5
+        min_quality_threshold: float = 0.5,
+        process_every_n_frames: int = 1  # Added frame skipping parameter
     ):
         """Initialize VideoProcessor with configurable parameters"""
         self.batch_size = batch_size
         self.buffer_size = buffer_size
         self.min_quality_threshold = min_quality_threshold
-        self.frame_selector = FrameSelector()
+        self.process_every_n_frames = process_every_n_frames  # New parameter
         self.temp_dir = Path(settings.TEMP_DIR)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.quality_assessor = AdaptiveFrameQualityAssessor()
-        self._cleanup_handlers_registered = False
         self.active_tasks = set()  # Track active tasks
 
     async def cleanup_resources(self):
@@ -105,7 +105,7 @@ class VideoProcessor:
         target_fps: Optional[int] = None,
         max_duration: Optional[int] = None
     ) -> AsyncGenerator[Tuple[List[np.ndarray], dict], None]:
-        """Extract frames with performance optimization"""
+        """Extract frames with performance optimization and frame skipping"""
         if not video_path.exists():
             yield [], self._create_error_metadata("Video file not found")
             return
@@ -113,50 +113,63 @@ class VideoProcessor:
         cap = cv2.VideoCapture(str(video_path))
         try:
             metadata = await self._get_video_properties(cap)
-            frame_buffer = asyncio.Queue(maxsize=self.buffer_size)
-            result_buffer = asyncio.Queue(maxsize=self.buffer_size)
             
-            # Use ThreadPoolExecutor for CPU-bound operations
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                # Start frame reader and quality assessor tasks
-                reader_task = asyncio.create_task(
-                    self._frame_reader(cap, frame_buffer, executor, metadata)
-                )
-                quality_task = asyncio.create_task(
-                    self._quality_assessor(frame_buffer, result_buffer)
-                )
+            # Implement frame skipping logic
+            frame_count = 0
+            batch_frames = []
+            batch_timestamps = []
+            
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 
-                try:
-                    while True:
-                        result_data = await result_buffer.get()
-                        if result_data is None:
-                            break
+                # Only process every nth frame (frame skipping)
+                if frame_count % self.process_every_n_frames == 0:
+                    # Use the frame directly - no need to copy for most cases
+                    batch_frames.append(frame)
+                    batch_timestamps.append(frame_count / metadata.get('fps', 30))
+                    
+                    # When we reach batch size, yield the batch
+                    if len(batch_frames) >= self.batch_size:
+                        # Perform quality assessment before yielding
+                        quality_frames = []
+                        for i, frm in enumerate(batch_frames):
+                            metrics = await self.quality_assessor.assess_frame(frm)
+                            if metrics.is_valid and metrics.overall_score >= self.min_quality_threshold:
+                                quality_frames.append(frm)
                         
-                        # Process frames efficiently
-                        frames = result_data['frames']
-                        if not frames:
-                            continue
+                        # Yield only quality frames
+                        if quality_frames:
+                            yield quality_frames, {
+                                **metadata,
+                                "frames_processed": len(quality_frames),
+                            }
                             
-                        # Use numpy operations for better performance
-                        frames_array = np.array(frames)
-                        yield frames_array.tolist(), {
-                            **metadata,
-                            "frames_processed": len(frames),
-                            "quality_metrics": self._calculate_quality_stats(result_data['metrics'])
-                        }
-                        
-                        # Allow other tasks to run
-                        await asyncio.sleep(0)
-                        
-                finally:
-                    # Cleanup tasks
-                    for task in [reader_task, quality_task]:
-                        if not task.done():
-                            task.cancel()
-                            try:
-                                await task
-                            except asyncio.CancelledError:
-                                pass
+                        # Clear the batch
+                        batch_frames = []
+                        batch_timestamps = []
+                    
+                frame_count += 1
+                
+                # Give control back to other tasks periodically
+                if frame_count % 10 == 0:
+                    await asyncio.sleep(0)
+            
+            # Process any remaining frames
+            if batch_frames:
+                quality_frames = []
+                for i, frm in enumerate(batch_frames):
+                    metrics = await self.quality_assessor.assess_frame(frm)
+                    if metrics.is_valid and metrics.overall_score >= self.min_quality_threshold:
+                        quality_frames.append(frm)
+                
+                if quality_frames:
+                    yield quality_frames, {
+                        **metadata,
+                        "frames_processed": len(quality_frames),
+                    }
+            
         finally:
             cap.release()
 
@@ -293,14 +306,14 @@ class VideoProcessor:
                 
                 # Detailed metrics logging
                 logger.info(f"""
-Frame {batch_data['index']} Quality Metrics:
-- Valid: {frame_metrics.is_valid}
-- Overall Score: {frame_metrics.overall_score:.3f} (threshold: {self.min_quality_threshold})
-- Brightness: {frame_metrics.brightness:.3f}
-- Contrast: {frame_metrics.contrast:.3f}
-- Blur Score: {frame_metrics.blur_score:.3f}
-- Coverage Score: {frame_metrics.coverage_score:.3f}
-                """)
+                    Frame {batch_data['index']} Quality Metrics:
+                    - Valid: {frame_metrics.is_valid}
+                    - Overall Score: {frame_metrics.overall_score:.3f} (threshold: {self.min_quality_threshold})
+                    - Brightness: {frame_metrics.brightness:.3f}
+                    - Contrast: {frame_metrics.contrast:.3f}
+                    - Blur Score: {frame_metrics.blur_score:.3f}
+                    - Coverage Score: {frame_metrics.coverage_score:.3f}
+                                    """)
                 
                 if frame_metrics.is_valid and frame_metrics.overall_score >= self.min_quality_threshold:
                     frames_passed += 1
@@ -447,9 +460,6 @@ Frame {batch_data['index']} Quality Metrics:
             
             await asyncio.sleep(0)
         
-        # Calculate quality statistics
-        quality_stats = self._calculate_quality_stats(quality_metrics)
-        
         return {
             "frames": frames,
             "metrics": quality_metrics,
@@ -458,7 +468,7 @@ Frame {batch_data['index']} Quality Metrics:
             "sampled_frames": frame_count,
             "quality_frames": len(frames),
             "frame_indices": frame_indices,
-            "quality_metrics": quality_stats
+            "quality_metrics": self._calculate_quality_stats(quality_metrics)
         }
     
     def _calculate_quality_stats(self, metrics: List[QualityMetrics]) -> Dict:

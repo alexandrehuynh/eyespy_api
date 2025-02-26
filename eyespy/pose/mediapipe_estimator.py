@@ -8,9 +8,6 @@ import cv2
 from concurrent.futures import ThreadPoolExecutor
 from .validation import PoseValidator
 from .confidence import AdaptiveConfidenceAssessor
-from .tracker import ConfidenceTracker
-from .movenet_estimator import MovenetEstimator
-from .fusion import PoseFusion
 import time
 import psutil
 import logging
@@ -18,6 +15,10 @@ import logging
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Shared executor for all processing
+CPU_COUNT = psutil.cpu_count(logical=False)  # Physical cores only
+SHARED_EXECUTOR = ThreadPoolExecutor(max_workers=max(4, CPU_COUNT - 1))
 
 class MediaPipeEstimator:
     def __init__(self):
@@ -33,22 +34,14 @@ class MediaPipeEstimator:
         # Thresholds and validators
         self.keypoint_thresholds = settings.KEYPOINT_THRESHOLDS
         self.validator = PoseValidator()
+        self.confidence_assessor = AdaptiveConfidenceAssessor()
         
-        # Initialize components for dual-model system
-        self.movenet = MovenetEstimator()
-        self.fusion = PoseFusion()
-        self.confidence_tracker = ConfidenceTracker()
-        
-        # Performance optimizations
-        cpu_count = psutil.cpu_count(logical=False)  # Physical cores only
-        self.executor = ThreadPoolExecutor(
-            max_workers=max(4, cpu_count - 1)  # Leave one core free for other tasks
-        )
-        self.batch_size = 50  # Increased from default
+        # Performance settings
+        self.batch_size = settings.BATCH_SIZE
         self.frame_metadata = {}
         
         # Add performance monitoring
-        self.processing_times: List[float] = []
+        self.processing_times = []
 
     async def process_frames(
         self,
@@ -62,10 +55,10 @@ class MediaPipeEstimator:
         total_frames = len(frames)
         tasks = []
         
-        # Create all tasks at once instead of processing sequentially
+        # Create all tasks at once
         for i in range(0, total_frames, batch_size):
             batch = frames[i:i + batch_size]
-            tasks.append(self._process_mediapipe_batch(batch))
+            tasks.append(self._process_batch(batch))
         
         # Process all batches concurrently
         results = await asyncio.gather(*tasks)
@@ -77,60 +70,14 @@ class MediaPipeEstimator:
         
         return all_keypoints
 
-    async def _process_mediapipe_batch(
+    async def _process_batch(
         self,
         batch: List[np.ndarray]
     ) -> List[Optional[List[Keypoint]]]:
-        """Process a batch of frames with MediaPipe in parallel"""
+        """Process a batch of frames with MediaPipe"""
         # Process frames in parallel using asyncio.gather
         tasks = [self._process_single_frame(frame) for frame in batch]
         return await asyncio.gather(*tasks)
-
-    async def _process_batch_results(
-        self,
-        mp_keypoints: List[Optional[List[Keypoint]]],
-        mn_keypoints: List[Optional[List[Keypoint]]]
-    ) -> List[Optional[List[Keypoint]]]:
-        """Process and fuse batch results"""
-        processed_keypoints = []
-        
-        for mp_kp, mn_kp in zip(mp_keypoints, mn_keypoints):
-            # Fuse predictions
-            fused_keypoints = await self.fusion.fuse_predictions(mp_kp, mn_kp)
-            
-            if fused_keypoints:
-                # Convert to format for tracker
-                kp_dict = {
-                    kp.name: (kp.x, kp.y, kp.confidence)
-                    for kp in fused_keypoints
-                }
-                
-                # Update tracking
-                tracked_kp = await self.confidence_tracker.update(kp_dict)
-                
-                # Convert back to keypoints
-                tracked_keypoints = [
-                    Keypoint(
-                        name=name,
-                        x=pos[0],
-                        y=pos[1],
-                        confidence=pos[2]
-                    )
-                    for name, pos in tracked_kp.items()
-                ]
-                
-                # Validate tracked pose
-                is_valid, validation_metrics = self.validator.validate_pose(tracked_keypoints)
-                
-                if is_valid:
-                    self.frame_metadata.update(validation_metrics)
-                    processed_keypoints.append(tracked_keypoints)
-                else:
-                    processed_keypoints.append(None)
-            else:
-                processed_keypoints.append(None)
-        
-        return processed_keypoints
 
     async def _process_single_frame(self, frame: np.ndarray) -> Optional[List[Keypoint]]:
         """Process a single frame with MediaPipe"""
@@ -141,7 +88,7 @@ class MediaPipeEstimator:
             # Process the frame with MediaPipe
             loop = asyncio.get_event_loop()
             results = await loop.run_in_executor(
-                self.executor,
+                SHARED_EXECUTOR,
                 lambda: self.pose.process(rgb_frame)
             )
             
@@ -169,19 +116,18 @@ class MediaPipeEstimator:
             return filtered_keypoints
             
         except Exception as e:
-            print(f"Error processing frame: {str(e)}")
+            logger.error(f"Error processing frame: {str(e)}")
             return None
 
     async def _filter_keypoints(self, keypoints: List[Keypoint]) -> List[Keypoint]:
-        """Filter keypoints with enhanced confidence assessment"""
+        """Filter keypoints with confidence assessment"""
         if not keypoints:
             return []
         
-        confidence_assessor = AdaptiveConfidenceAssessor()
         positions = {kp.name: (kp.x, kp.y) for kp in keypoints}
         confidences = {kp.name: kp.confidence for kp in keypoints}
         
-        adjusted_confidences = await confidence_assessor.assess_keypoints(
+        adjusted_confidences = await self.confidence_assessor.assess_keypoints(
             positions,
             confidences
         )
@@ -194,7 +140,9 @@ class MediaPipeEstimator:
                 name=kp.name
             )
             for kp in keypoints
-            if adjusted_confidences.get(kp.name, 0) > 0
+            if adjusted_confidences.get(kp.name, 0) > self.keypoint_thresholds.get(
+                kp.name, settings.GLOBAL_CONFIDENCE_THRESHOLD
+            )
         ]
 
     def _validate_pose(self, keypoints: List[Keypoint]) -> bool:
@@ -215,11 +163,22 @@ class MediaPipeEstimator:
         return len(detected_critical) >= 3
 
     def __del__(self):
-        """Cleanup resources"""
+        """Cleanup resources with proper error handling"""
         try:
             if hasattr(self, 'pose'):
+                # Add a short delay to ensure all processing is complete
+                try:
+                    import asyncio
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.run_until_complete(asyncio.sleep(0.1))
+                except:
+                    pass
+                    
+                # Close pose object
                 self.pose.close()
-            if hasattr(self, 'executor'):
-                self.executor.shutdown(wait=False)
         except Exception as e:
-            print(f"Error during cleanup: {str(e)}")
+            # Specifically ignore MediaPipe timestamp errors during cleanup
+            error_msg = str(e)
+            if "Packet timestamp mismatch" not in error_msg and "CalculatorGraph" not in error_msg:
+                logger.error(f"Error during cleanup: {error_msg}")

@@ -4,16 +4,12 @@ from .config import settings
 from .models import PoseEstimationResponse, ProcessingStatus, ConfidenceMetrics, Keypoint
 from .video import VideoProcessor
 from .pose.mediapipe_estimator import MediaPipeEstimator
-from .pose.movenet_estimator import MovenetEstimator
-from .pose.fusion import PoseFusion
 import time
 from typing import Optional, Dict, List
 import psutil
 import logging
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import numpy as np
-from .utils.performance import PerformanceConfig, PerformanceMonitor
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -41,7 +37,6 @@ async def process_video(
     video: UploadFile = File(...),
     target_fps: Optional[int] = None,
     max_duration: Optional[int] = None,
-    batch_size: int = 50,
     performance_mode: str = "balanced"  # ["fast", "balanced", "quality"]
 ) -> PoseEstimationResponse:
     processing_start = time.time()
@@ -49,25 +44,15 @@ async def process_video(
     batch_times = []
     memory_usage = []
     metadata = {}
-    fused_results = []
     
-    # Initialize performance monitor with mode-specific settings
-    perf_config = PerformanceConfig(
-        max_memory_percent=80.0 if performance_mode == "fast" else 90.0,
-        target_fps=30.0 if performance_mode == "fast" else 20.0,
-        batch_size_min=10,
-        batch_size_max=100 if performance_mode == "fast" else 50,
-        adaptive_batch_size=True
-    )
-    perf_monitor = PerformanceMonitor(perf_config)
-    
-    logger.info(f"Starting video processing with target_fps={target_fps}, batch_size={batch_size}")
+    logger.info(f"Starting video processing with target_fps={target_fps}")
     
     try:
-        video_processor = VideoProcessor(batch_size=batch_size)
+        video_processor = VideoProcessor(
+            process_every_n_frames=2 if performance_mode == "fast" else 1,
+            min_quality_threshold=0.4 if performance_mode == "fast" else 0.5
+        )
         pose_estimator = MediaPipeEstimator()
-        movenet_estimator = MovenetEstimator()
-        pose_fusion = PoseFusion()
         
         # Save uploaded video
         video_path = await video_processor.save_upload(video)
@@ -76,6 +61,8 @@ async def process_video(
             raise HTTPException(status_code=400, detail="Unable to save video")
             
         logger.info(f"Video saved to: {video_path}")
+        
+        all_keypoints = []
         
         # Process frames in streaming mode
         async for frames_chunk, chunk_metadata in video_processor.extract_frames(
@@ -89,40 +76,18 @@ async def process_video(
             metadata = chunk_metadata
             batch_start = time.time()
             
-            # Check system resources
-            perf_metrics = await perf_monitor.check_resources()
-            if perf_metrics['memory_usage'] > perf_config.max_memory_percent:
-                logger.warning("High memory usage detected, adding delay")
-                await asyncio.sleep(0.1)
-            
-            # Update batch size dynamically
-            video_processor.batch_size = perf_monitor.current_batch_size
-            
             try:
                 logger.debug(f"Processing batch of {len(frames_chunk)} frames")
-                # Run both models concurrently
-                mediapipe_task = pose_estimator.process_frames(frames_chunk)
-                movenet_task = movenet_estimator.process_frames(frames_chunk)
+                # Process frames with MediaPipe
+                keypoints = await pose_estimator.process_frames(frames_chunk)
                 
-                mp_keypoints, mn_keypoints = await asyncio.gather(
-                    mediapipe_task,
-                    movenet_task
-                )
-                
-                logger.debug(f"MediaPipe detected: {len([k for k in mp_keypoints if k is not None])} poses")
-                logger.debug(f"MoveNet detected: {len([k for k in mn_keypoints if k is not None])} poses")
-                
-                # Fuse results for each frame in the chunk
-                batch_results = []
-                for mp_kp, mn_kp in zip(mp_keypoints, mn_keypoints):
-                    fused_kp = await pose_fusion.fuse_predictions(mp_kp, mn_kp)
-                    batch_results.append(fused_kp)
-                
-                fused_results.extend(batch_results)  # Add batch results to overall results
+                # Add valid keypoints to results
+                for kp_list in keypoints:
+                    if kp_list is not None:
+                        all_keypoints.extend(kp_list)
                 
                 # Update metrics
-                processed_frames += len(batch_results)
-                perf_monitor.frames_processed += len(frames_chunk)
+                processed_frames += len(frames_chunk)
                 batch_time = time.time() - batch_start
                 batch_times.append(batch_time)
                 memory_usage.append(psutil.Process().memory_percent())
@@ -137,8 +102,7 @@ async def process_video(
                 
                 # Free memory explicitly
                 del frames_chunk
-                del mp_keypoints
-                del mn_keypoints
+                del keypoints
                 
             except Exception as e:
                 logger.error(f"Error processing batch: {str(e)}")
@@ -150,9 +114,6 @@ async def process_video(
         avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
         avg_memory = sum(memory_usage) / len(memory_usage) if memory_usage else 0
         
-        # Final performance report
-        final_metrics = await perf_monitor.check_resources()
-        logger.info(f"Final performance metrics: {final_metrics}")
         logger.info(f"Processing complete. Metrics: {avg_fps:.1f} FPS, {avg_batch_time:.3f} seconds per batch, {avg_memory:.1f}% memory usage")
         
         # Add this to your code for monitoring
@@ -161,8 +122,8 @@ async def process_video(
         logger.info(f"Memory usage: {memory_percent}%")
         
         return PoseEstimationResponse(
-            status="success" if processed_frames > 0 else "failed",
-            keypoints=fused_results if processed_frames > 0 else None,
+            status=ProcessingStatus.COMPLETED if processed_frames > 0 else ProcessingStatus.FAILED,
+            keypoints=all_keypoints if processed_frames > 0 else None,
             metadata={
                 "processing_time": total_time,
                 "frames_processed": processed_frames,
@@ -176,10 +137,10 @@ async def process_video(
                 }
             },
             confidence_metrics={
-                "average_confidence": np.mean([kp.confidence for kp in fused_results]) if fused_results else 0.0,
+                "average_confidence": np.mean([kp.confidence for kp in all_keypoints if hasattr(kp, 'confidence')]) if all_keypoints else 0.0,
                 "keypoints": {
                     "processed": processed_frames,
-                    "detected": len([k for k in fused_results if k is not None]) if fused_results else 0
+                    "detected": len(all_keypoints) if all_keypoints else 0
                 }
             },
             validation_metrics=pose_estimator.frame_metadata,

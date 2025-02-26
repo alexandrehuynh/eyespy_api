@@ -155,50 +155,26 @@ class AdaptiveConfidenceAssessor:
         keypoints: Dict[str, tuple],
         confidences: Dict[str, float]
     ) -> Dict[str, float]:
-        """Assess keypoint confidences in parallel"""
-        loop = asyncio.get_event_loop()
+        """Simplified keypoint confidence assessment"""
+        adjusted_confidences = {}
         
-        # Create tasks for parallel anatomical checks
-        tasks = [
-            loop.run_in_executor(
-                self.executor,
-                self._check_group_consistency,
-                group_name,
-                keypoint_list,
-                keypoints,
-                confidences
-            )
-            for group_name, keypoint_list in self.keypoint_groups.items()
-        ]
-        
-        # Add parallel confidence adjustment tasks
-        tasks.extend([
-            loop.run_in_executor(
-                self.executor,
-                self._adjust_confidence,
-                name,
-                pos,
-                conf,
-                keypoints,
-                confidences
-            )
-            for name, (pos, conf) in zip(keypoints.keys(), zip(keypoints.values(), confidences.values()))
-        ])
-        
-        # Wait for all assessments to complete
-        results = await asyncio.gather(*tasks)
-        
-        # Combine group consistency checks and adjusted confidences
-        group_results = results[:len(self.keypoint_groups)]
-        confidence_results = results[len(self.keypoint_groups):]
-        
-        # Merge results
-        final_confidences = {}
-        for name, adjusted_conf in zip(keypoints.keys(), confidence_results):
-            group_factor = self._get_group_factor(name, group_results)
-            final_confidences[name] = min(1.0, adjusted_conf * group_factor)
+        # Apply simple threshold-based filtering
+        for name, confidence in confidences.items():
+            threshold = self.thresholds.get_threshold(name)
             
-        return final_confidences
+            # Basic adjustment - just apply threshold and a small boost for core points
+            if name in self.thresholds.core_points:
+                adjusted_confidences[name] = min(1.0, confidence * 1.1)  # Small boost for core
+            elif name in self.thresholds.extremity_points:
+                adjusted_confidences[name] = confidence * 0.9  # Small reduction for extremities
+            else:
+                adjusted_confidences[name] = confidence
+            
+            # Filter out low confidence points
+            if adjusted_confidences[name] < threshold:
+                adjusted_confidences[name] = 0  # Remove low confidence points
+        
+        return adjusted_confidences
 
     def _check_group_consistency(
         self,
