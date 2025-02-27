@@ -5,20 +5,17 @@ from ..models import Keypoint
 from ..config import settings
 import asyncio
 import cv2
-from concurrent.futures import ThreadPoolExecutor
 from .validation import PoseValidator
 from .confidence import AdaptiveConfidenceAssessor
 import time
 import psutil
 import logging
+from ..utils.executor_service import get_executor
+from ..utils.async_utils import run_in_executor
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Shared executor for all processing
-CPU_COUNT = psutil.cpu_count(logical=False)  # Physical cores only
-SHARED_EXECUTOR = ThreadPoolExecutor(max_workers=max(4, CPU_COUNT - 1))
 
 class MediaPipeEstimator:
     def __init__(self):
@@ -85,12 +82,8 @@ class MediaPipeEstimator:
             # Convert BGR to RGB
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Process the frame with MediaPipe
-            loop = asyncio.get_event_loop()
-            results = await loop.run_in_executor(
-                SHARED_EXECUTOR,
-                lambda: self.pose.process(rgb_frame)
-            )
+            # Process the frame with MediaPipe using shared executor
+            results = await run_in_executor(self.pose.process, rgb_frame)
             
             if not results.pose_landmarks:
                 return None

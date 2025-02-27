@@ -2,7 +2,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from ..utils.executor_service import get_executor
+from ..utils.async_utils import run_in_executor, gather_with_concurrency
 
 @dataclass
 class ConfidenceThresholds:
@@ -134,7 +135,6 @@ class ThresholdAdjuster:
 class AdaptiveConfidenceAssessor:
     def __init__(self, thresholds: Optional[ConfidenceThresholds] = None):
         self.thresholds = thresholds or ConfidenceThresholds()
-        self.executor = ThreadPoolExecutor(max_workers=4)
         
         # Define keypoint relationships for parallel processing
         self.keypoint_groups = {
@@ -176,22 +176,22 @@ class AdaptiveConfidenceAssessor:
         
         return adjusted_confidences
 
-    def _check_group_consistency(
+    async def _check_group_consistency(
         self,
         group_name: str,
         keypoint_list: List[str],
         keypoints: Dict[str, tuple],
         confidences: Dict[str, float]
     ) -> Tuple[str, float]:
-        """Check anatomical consistency within a group"""
+        """Check anatomical consistency within a group using shared executor"""
         if group_name == 'core':
-            return self._check_core_consistency(keypoints, confidences)
+            return await run_in_executor(self._check_core_consistency, keypoints, confidences)
         elif group_name == 'arms':
-            return self._check_arm_consistency(keypoints, confidences)
+            return await run_in_executor(self._check_arm_consistency, keypoints, confidences)
         elif group_name == 'legs':
-            return self._check_leg_consistency(keypoints, confidences)
+            return await run_in_executor(self._check_leg_consistency, keypoints, confidences)
         elif group_name == 'face':
-            return self._check_face_consistency(keypoints, confidences)
+            return await run_in_executor(self._check_face_consistency, keypoints, confidences)
         return group_name, 1.0
 
     def _check_core_consistency(
@@ -284,7 +284,7 @@ class AdaptiveConfidenceAssessor:
         # Apply position-based adjustments
         if keypoint_name in self.keypoint_groups['core']:
             return min(1.0, confidence * 1.2)  # Boost core keypoints
-        elif keypoint_name in self.keypoint_groups['extremities']:
+        elif keypoint_name in self.keypoint_groups.get('extremities', []):
             return min(1.0, confidence * 0.9)  # Reduce extremity confidence
             
         return confidence
@@ -304,11 +304,8 @@ class AdaptiveConfidenceAssessor:
         batch_confidences: List[Dict[str, float]]
     ) -> List[Dict[str, float]]:
         """Process multiple keypoint sets in parallel"""
-        return await asyncio.gather(*[
-            self.assess_keypoints(kps, confs)
-            for kps, confs in zip(batch_keypoints, batch_confidences)
-        ])
-
-    def __del__(self):
-        """Cleanup executor"""
-        self.executor.shutdown(wait=False)
+        # Limit concurrency to a reasonable number to avoid thread starvation
+        return await gather_with_concurrency(
+            4,  # Process up to 4 frames concurrently
+            *[self.assess_keypoints(kps, confs) for kps, confs in zip(batch_keypoints, batch_confidences)]
+        )

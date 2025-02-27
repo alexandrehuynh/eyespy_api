@@ -1,6 +1,9 @@
 from typing import List, Dict, Optional, Tuple
 import numpy as np
+import asyncio
 from ..models import Keypoint
+from ..utils.executor_service import get_executor
+from ..utils.async_utils import run_in_executor
 
 class PoseValidator:
     def __init__(self):
@@ -60,11 +63,21 @@ class PoseValidator:
         except:
             return 0.0
 
-    def check_angle_constraints(
+    async def check_angle_constraints(
         self,
         keypoints: List[Keypoint]
     ) -> Dict[str, bool]:
         """Check if joint angles are within anatomical constraints"""
+        return await run_in_executor(
+            self._check_angle_constraints_sync,
+            keypoints
+        )
+    
+    def _check_angle_constraints_sync(
+        self,
+        keypoints: List[Keypoint]
+    ) -> Dict[str, bool]:
+        """Synchronous implementation of angle constraint checking"""
         keypoint_dict = {kp.name: kp for kp in keypoints}
         angle_validations = {}
         
@@ -84,11 +97,21 @@ class PoseValidator:
                 
         return angle_validations
 
-    def check_position_rules(
+    async def check_position_rules(
         self,
         keypoints: List[Keypoint]
     ) -> Dict[str, bool]:
         """Check if keypoints follow expected relative positions"""
+        return await run_in_executor(
+            self._check_position_rules_sync,
+            keypoints
+        )
+    
+    def _check_position_rules_sync(
+        self,
+        keypoints: List[Keypoint]
+    ) -> Dict[str, bool]:
+        """Synchronous implementation of position rule checking"""
         keypoint_dict = {kp.name: kp for kp in keypoints}
         position_validations = {}
         
@@ -111,8 +134,15 @@ class PoseValidator:
                 
         return position_validations
 
-    def check_symmetry(self, keypoints: List[Keypoint]) -> Dict[str, float]:
+    async def check_symmetry(self, keypoints: List[Keypoint]) -> Dict[str, float]:
         """Vectorized symmetry check"""
+        return await run_in_executor(
+            self._check_symmetry_sync,
+            keypoints
+        )
+    
+    def _check_symmetry_sync(self, keypoints: List[Keypoint]) -> Dict[str, float]:
+        """Synchronous implementation of symmetry checking"""
         keypoint_dict = {kp.name: kp for kp in keypoints}
         symmetry_scores = {}
         
@@ -136,19 +166,23 @@ class PoseValidator:
                 
         return symmetry_scores
 
-    def validate_pose(
+    async def validate_pose(
         self,
         keypoints: List[Keypoint]
     ) -> Tuple[bool, Dict[str, any]]:
         """Complete pose validation with detailed metrics"""
-        # Run all validation checks
-        angle_checks = self.check_angle_constraints(keypoints)
-        position_checks = self.check_position_rules(keypoints)
-        symmetry_scores = self.check_symmetry(keypoints)
+        # Run all validation checks in parallel
+        angle_checks_task = self.check_angle_constraints(keypoints)
+        position_checks_task = self.check_position_rules(keypoints)
+        symmetry_scores_task = self.check_symmetry(keypoints)
+        
+        angle_checks, position_checks, symmetry_scores = await asyncio.gather(
+            angle_checks_task, position_checks_task, symmetry_scores_task
+        )
         
         # Calculate overall validation score
-        angle_score = sum(angle_checks.values()) / len(angle_checks)
-        position_score = sum(position_checks.values()) / len(position_checks)
+        angle_score = sum(angle_checks.values()) / len(angle_checks) if angle_checks else 0
+        position_score = sum(position_checks.values()) / len(position_checks) if position_checks else 0
         symmetry_score = sum(symmetry_scores.values()) / len(symmetry_scores) if symmetry_scores else 0
         
         overall_score = (angle_score + position_score + symmetry_score) / 3

@@ -2,8 +2,9 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from .quality import QualityMetrics
+from ..utils.executor_service import get_executor
+from ..utils.async_utils import run_in_executor, gather_with_concurrency
 
 @dataclass
 class FrameScore:
@@ -27,7 +28,6 @@ class FrameSelector:
         self.min_quality_score = min_quality_score
         self.max_blur_score = max_blur_score
         self.selection_window = selection_window
-        self.executor = ThreadPoolExecutor(max_workers=4)
         self.batch_size = 50
 
     async def select_best_frames(
@@ -43,25 +43,22 @@ class FrameSelector:
             if target_count is None:
                 target_count = len(frames) // self.selection_window
 
-            # Process batches in parallel
-            loop = asyncio.get_running_loop()
+            # Calculate batch sizes for parallel processing
+            total_frames = len(frames)
+            batch_size = min(self.batch_size, max(10, total_frames // 4))
+            
+            # Process batches in parallel with concurrency limit
             batch_tasks = []
             
-            for i in range(0, len(frames), self.batch_size):
-                batch_frames = frames[i:i + self.batch_size]
-                batch_metrics = quality_metrics[i:i + self.batch_size]
+            for i in range(0, total_frames, batch_size):
+                batch_frames = frames[i:i + batch_size]
+                batch_metrics = quality_metrics[i:i + batch_size]
                 
-                task = loop.run_in_executor(
-                    self.executor,
-                    self._score_batch,
-                    batch_frames,
-                    batch_metrics,
-                    i
-                )
+                task = self._score_batch(batch_frames, batch_metrics, i)
                 batch_tasks.append(task)
 
-            # Gather all batch results
-            batch_results = await asyncio.gather(*batch_tasks)
+            # Use concurrency control to limit parallel execution
+            batch_results = await gather_with_concurrency(4, *batch_tasks)
             
             # Combine all scores
             all_scores = []
@@ -85,35 +82,37 @@ class FrameSelector:
 
             return selected_frames, selected_indices, selection_stats
 
-    def _create_batches(
-        self,
-        frames: List[np.ndarray],
-        metrics: List[QualityMetrics],
-        batch_size: int
-    ) -> List[Tuple[List[np.ndarray], List[QualityMetrics]]]:
-        """Split frames and metrics into batches"""
-        batches = []
-        for i in range(0, len(frames), batch_size):
-            batch_frames = frames[i:i + batch_size]
-            batch_metrics = metrics[i:i + batch_size]
-            batches.append((batch_frames, batch_metrics))
-        return batches
-
-    def _score_batch(
+    async def _score_batch(
         self,
         batch_frames: List[np.ndarray],
         batch_metrics: List[QualityMetrics],
         start_idx: int
     ) -> List[FrameScore]:
         """Score a batch of frames"""
+        return await run_in_executor(
+            self._score_batch_sync,
+            batch_frames,
+            batch_metrics,
+            start_idx
+        )
+    
+    def _score_batch_sync(
+        self,
+        batch_frames: List[np.ndarray],
+        batch_metrics: List[QualityMetrics],
+        start_idx: int
+    ) -> List[FrameScore]:
+        """Synchronous implementation of batch scoring for executor"""
         scores = []
+        total_frames = len(batch_frames)
+        
         for i, (frame, metrics) in enumerate(zip(batch_frames, batch_metrics)):
             frame_idx = start_idx + i
             
             # Calculate temporal score based on frame position
             temporal_score = self._calculate_temporal_score(
                 frame_idx,
-                len(batch_frames)
+                total_frames
             )
             
             # Combine scores
@@ -188,8 +187,7 @@ class FrameSelector:
         # Calculate window size for temporal distribution
         window_size = total_frames // target_count
 
-        # Process selection windows in parallel
-        loop = asyncio.get_event_loop()
+        # Process selection windows in parallel with concurrency control
         window_tasks = []
         
         for i in range(0, total_frames, window_size):
@@ -200,15 +198,14 @@ class FrameSelector:
             ]
             
             if window_scores:
-                task = loop.run_in_executor(
-                    self.executor,
+                task = run_in_executor(
                     self._select_best_in_window,
                     window_scores
                 )
                 window_tasks.append(task)
 
-        # Gather selected indices from all windows
-        selected_from_windows = await asyncio.gather(*window_tasks)
+        # Use concurrency control to limit parallel execution
+        selected_from_windows = await gather_with_concurrency(8, *window_tasks)
         
         # Combine and sort final selections
         selected_indices = []
@@ -233,7 +230,21 @@ class FrameSelector:
         scores: List[FrameScore],
         quality_metrics: List[QualityMetrics]
     ) -> Dict[str, float]:
-        """Calculate statistics for selected frames in parallel"""
+        """Calculate statistics for selected frames"""
+        return await run_in_executor(
+            self._calculate_selection_stats_sync,
+            selected_indices,
+            scores,
+            quality_metrics
+        )
+    
+    def _calculate_selection_stats_sync(
+        self,
+        selected_indices: List[int],
+        scores: List[FrameScore],
+        quality_metrics: List[QualityMetrics]
+    ) -> Dict[str, float]:
+        """Synchronous implementation of statistics calculation for executor"""
         selected_scores = [
             s for s in scores if s.frame_index in selected_indices
         ]
@@ -249,7 +260,3 @@ class FrameSelector:
             'temporal_distribution': np.std(selected_indices) / len(scores),
             'selection_rate': len(selected_indices) / len(scores)
         }
-
-    def __del__(self):
-        """Cleanup executor"""
-        self.executor.shutdown(wait=False)

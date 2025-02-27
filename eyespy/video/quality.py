@@ -3,9 +3,10 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import logging
 import time
+from ..utils.executor_service import get_executor
+from ..utils.async_utils import run_in_executor, gather_with_concurrency
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,6 @@ class QualityMetrics:
 class AdaptiveFrameQualityAssessor:
     def __init__(self, initial_thresholds: Optional[QualityThresholds] = None):
         self.thresholds = initial_thresholds or QualityThresholds()
-        self.executor = ThreadPoolExecutor(max_workers=4)
         self.calibrated = False
         self.calibration_size = 30
         self.calibration_stats = {
@@ -68,26 +68,28 @@ class AdaptiveFrameQualityAssessor:
             'coverage': []
         }
 
-    def calibrate_thresholds(self, calibration_frames: List[np.ndarray]) -> bool:
+    async def calibrate_thresholds(self, calibration_frames: List[np.ndarray]) -> bool:
         """Calibrate quality thresholds based on sample frames"""
         try:
-            print(f"Starting calibration with {len(calibration_frames)} frames")
+            logger.info(f"Starting calibration with {len(calibration_frames)} frames")
             if not calibration_frames:
                 return False
 
-            # Process calibration frames
+            # Process calibration frames in parallel using the shared executor
+            tasks = []
             for frame in calibration_frames:
                 if frame is None:
                     continue
-
-                # Convert to grayscale
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-                # Collect metrics
-                self.calibration_stats['brightness'].append(self._calculate_brightness(frame))
-                self.calibration_stats['contrast'].append(self._calculate_contrast(frame))
-                self.calibration_stats['blur'].append(self._calculate_blur(frame))
-                self.calibration_stats['coverage'].append(self._calculate_coverage(frame))
+                tasks.append(self._process_calibration_frame(frame))
+            
+            results = await asyncio.gather(*tasks)
+            
+            # Update calibration stats with results
+            for brightness, contrast, blur, coverage in results:
+                self.calibration_stats['brightness'].append(brightness)
+                self.calibration_stats['contrast'].append(contrast)
+                self.calibration_stats['blur'].append(blur)
+                self.calibration_stats['coverage'].append(coverage)
 
             # Calculate adaptive thresholds
             if all(len(stats) > 0 for stats in self.calibration_stats.values()):
@@ -112,8 +114,8 @@ class AdaptiveFrameQualityAssessor:
                 self.thresholds.min_coverage = max(0.1, coverage_mean - 0.2)
                 self.thresholds.optimal_coverage = coverage_mean
 
-                print("Calibration completed successfully")
-                print(f"Adjusted thresholds: {self.thresholds.to_dict()}")
+                logger.info("Calibration completed successfully")
+                logger.info(f"Adjusted thresholds: {self.thresholds.to_dict()}")
                 
                 self.calibrated = True
                 return True
@@ -121,8 +123,25 @@ class AdaptiveFrameQualityAssessor:
             return False
 
         except Exception as e:
-            print(f"Error during calibration: {str(e)}")
+            logger.error(f"Error during calibration: {str(e)}")
             return False
+
+    async def _process_calibration_frame(self, frame: np.ndarray) -> Tuple[float, float, float, float]:
+        """Process a single calibration frame"""
+        # Convert to grayscale
+        gray = await run_in_executor(cv2.cvtColor, frame, cv2.COLOR_BGR2GRAY)
+        
+        # Calculate metrics in parallel
+        brightness_task = run_in_executor(self._calculate_brightness, frame)
+        contrast_task = run_in_executor(self._calculate_contrast, frame)
+        blur_task = run_in_executor(self._calculate_blur, frame)
+        coverage_task = run_in_executor(self._calculate_coverage, frame)
+        
+        brightness, contrast, blur, coverage = await asyncio.gather(
+            brightness_task, contrast_task, blur_task, coverage_task
+        )
+        
+        return brightness, contrast, blur, coverage
 
     def _calculate_brightness(self, frame: np.ndarray) -> float:
         """Calculate average brightness of frame"""
@@ -202,11 +221,15 @@ class AdaptiveFrameQualityAssessor:
             # Log frame properties
             logger.debug(f"Assessing frame: shape={frame.shape}, dtype={frame.dtype}")
             
-            # Calculate metrics
-            brightness = self._calculate_brightness(frame)
-            contrast = self._calculate_contrast(frame)
-            blur = self._calculate_blur(frame)
-            coverage = self._calculate_coverage(frame)
+            # Calculate metrics in parallel using shared executor
+            brightness_task = run_in_executor(self._calculate_brightness, frame)
+            contrast_task = run_in_executor(self._calculate_contrast, frame)
+            blur_task = run_in_executor(self._calculate_blur, frame)
+            coverage_task = run_in_executor(self._calculate_coverage, frame)
+            
+            brightness, contrast, blur, coverage = await asyncio.gather(
+                brightness_task, contrast_task, blur_task, coverage_task
+            )
             
             # Calculate overall score
             overall_score = self._calculate_overall_score(brightness, contrast, blur, coverage)

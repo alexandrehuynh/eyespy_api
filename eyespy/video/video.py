@@ -10,7 +10,8 @@ from collections import deque
 from ..config import settings
 from .quality import AdaptiveFrameQualityAssessor, QualityMetrics
 from .frame_selector import FrameSelector
-from concurrent.futures import ThreadPoolExecutor
+from ..utils.executor_service import get_executor
+from ..utils.async_utils import run_in_executor, gather_with_concurrency
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -87,10 +88,6 @@ class VideoProcessor:
                     logger.debug(f"Removed temporary file: {temp_file}")
                 except Exception as e:
                     logger.error(f"Error removing temporary file {temp_file}: {e}")
-
-        # Release other resources
-        if hasattr(self, 'quality_assessor'):
-            self.quality_assessor.__del__()
         
         logger.info("Cleanup completed")
 
@@ -120,7 +117,8 @@ class VideoProcessor:
             batch_timestamps = []
             
             while cap.isOpened():
-                ret, frame = cap.read()
+                # Use shared executor to read frames
+                ret, frame = await run_in_executor(cap.read)
                 if not ret:
                     break
                 
@@ -132,12 +130,24 @@ class VideoProcessor:
                     
                     # When we reach batch size, yield the batch
                     if len(batch_frames) >= self.batch_size:
-                        # Perform quality assessment before yielding
-                        quality_frames = []
-                        for i, frm in enumerate(batch_frames):
-                            metrics = await self.quality_assessor.assess_frame(frm)
-                            if metrics.is_valid and metrics.overall_score >= self.min_quality_threshold:
-                                quality_frames.append(frm)
+                        # Perform quality assessment before yielding - run in parallel
+                        quality_assessment_tasks = [
+                            self.quality_assessor.assess_frame(frm)
+                            for frm in batch_frames
+                        ]
+                        
+                        # Use gather with concurrency to limit parallel processing
+                        batch_metrics = await gather_with_concurrency(
+                            4,  # Process up to 4 frames at a time
+                            *quality_assessment_tasks
+                        )
+                        
+                        # Filter quality frames
+                        quality_frames = [
+                            frm for i, frm in enumerate(batch_frames)
+                            if batch_metrics[i].is_valid and 
+                            batch_metrics[i].overall_score >= self.min_quality_threshold
+                        ]
                         
                         # Yield only quality frames
                         if quality_frames:
@@ -158,11 +168,23 @@ class VideoProcessor:
             
             # Process any remaining frames
             if batch_frames:
-                quality_frames = []
-                for i, frm in enumerate(batch_frames):
-                    metrics = await self.quality_assessor.assess_frame(frm)
-                    if metrics.is_valid and metrics.overall_score >= self.min_quality_threshold:
-                        quality_frames.append(frm)
+                # Process remaining frames in parallel
+                quality_assessment_tasks = [
+                    self.quality_assessor.assess_frame(frm)
+                    for frm in batch_frames
+                ]
+                
+                batch_metrics = await gather_with_concurrency(
+                    4,  # Process up to 4 frames at a time
+                    *quality_assessment_tasks
+                )
+                
+                # Filter quality frames
+                quality_frames = [
+                    frm for i, frm in enumerate(batch_frames)
+                    if batch_metrics[i].is_valid and 
+                    batch_metrics[i].overall_score >= self.min_quality_threshold
+                ]
                 
                 if quality_frames:
                     yield quality_frames, {
@@ -177,7 +199,6 @@ class VideoProcessor:
         self,
         cap: cv2.VideoCapture,
         frame_buffer: asyncio.Queue,
-        executor: ThreadPoolExecutor,
         metadata: Dict
     ) -> None:
         """Read frames from video and put them in buffer"""
@@ -193,9 +214,8 @@ class VideoProcessor:
             logger.info(f"Video properties: FPS={fps}, Target FPS={target_fps}, Frame Interval={frame_interval}")
             
             while cap.isOpened():
-                ret, frame = await asyncio.get_event_loop().run_in_executor(
-                    executor, cap.read
-                )
+                # Use shared executor to read frames
+                ret, frame = await run_in_executor(cap.read)
                 
                 if not ret:
                     logger.info(f"Frame reading complete. Total frames read: {frame_count}")
@@ -241,7 +261,9 @@ class VideoProcessor:
 
     async def _process_batch(self, frames: List[np.ndarray]) -> List[QualityMetrics]:
         """Process a batch of frames with proper async handling"""
-        return await asyncio.gather(
+        # Process frames in parallel with concurrency control
+        return await gather_with_concurrency(
+            4,  # Process up to 4 frames at a time
             *[self.quality_assessor.assess_frame(frame) for frame in frames]
         )
 
@@ -262,17 +284,17 @@ class VideoProcessor:
                 metrics.extend(result_data['metrics'])
             
             if not frames:
-                print("No frames collected for selection")
+                logger.warning("No frames collected for selection")
                 return [], {}
 
-            # Properly await the frame selection
+            # Use the frame selector with the shared executor
             selected_frames, selected_indices, selection_stats = await self.frame_selector.select_best_frames(
                 frames,
                 metrics
             )
             
             stats = {
-                'quality_stats': self._calculate_quality_stats(metrics),
+                'quality_stats': await run_in_executor(self._calculate_quality_stats, metrics),
                 'selection_stats': selection_stats,
                 'frame_indices': selected_indices
             }
@@ -280,7 +302,7 @@ class VideoProcessor:
             return selected_frames, stats
             
         except Exception as e:
-            print(f"Frame selection error: {str(e)}")
+            logger.error(f"Frame selection error: {str(e)}")
             return [], {}
 
     async def _quality_assessor(self, frame_buffer: asyncio.Queue, result_buffer: asyncio.Queue):
@@ -340,7 +362,8 @@ class VideoProcessor:
             frame_count = 0
             
             while len(calibration_frames) < self.quality_assessor.calibration_size:
-                ret, frame = cap.read()
+                # Use shared executor for frame reading
+                ret, frame = await run_in_executor(cap.read)
                 if not ret:
                     break
                     
@@ -359,25 +382,33 @@ class VideoProcessor:
                 if frame_count % 5 == 0:
                     await asyncio.sleep(0)
             
-            print(f"Collected {len(calibration_frames)} frames for calibration")
+            logger.info(f"Collected {len(calibration_frames)} frames for calibration")
             
             if calibration_frames:
-                if self.quality_assessor.calibrate_thresholds(calibration_frames):
+                if await self.quality_assessor.calibrate_thresholds(calibration_frames):
                     return {
                         'success': True,
                         'frames_sampled': len(calibration_frames),
                         'frame_count': frame_count
                     }
             
-            print("Failed to collect enough calibration frames")
+            logger.warning("Failed to collect enough calibration frames")
             return None
             
         except Exception as e:
-            print(f"Calibration error: {str(e)}")
+            logger.error(f"Calibration error: {str(e)}")
             return None
 
     async def _get_video_properties(self, cap: cv2.VideoCapture) -> Dict:
         """Get video properties with frame interval calculation"""
+        # Run in executor to avoid blocking the event loop
+        return await run_in_executor(
+            self._get_video_properties_sync,
+            cap
+        )
+    
+    def _get_video_properties_sync(self, cap: cv2.VideoCapture) -> Dict:
+        """Synchronous implementation of getting video properties"""
         try:
             fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -427,12 +458,12 @@ class VideoProcessor:
             batch_frames = []
             batch_indices = []
             
-            # Read batch of frames
+            # Read batch of frames using shared executor
             for _ in range(self.batch_size):
                 if frame_count >= self.batch_size:
                     break
                     
-                ret, frame = cap.read()
+                ret, frame = await run_in_executor(cap.read)
                 if not ret:
                     break
                 
@@ -445,7 +476,7 @@ class VideoProcessor:
             if not batch_frames:
                 break
             
-            # Process batch
+            # Process batch with concurrency control
             batch_metrics = await self._process_batch(batch_frames)
             
             # Filter and store quality frames
@@ -509,7 +540,7 @@ class VideoProcessor:
                 
             return temp_file
         except Exception as e:
-            print(f"Error saving upload: {str(e)}")
+            logger.error(f"Error saving upload: {str(e)}")
             return None
 
     async def cleanup(self, file_path: Path):
@@ -518,4 +549,4 @@ class VideoProcessor:
             if file_path and file_path.exists():
                 file_path.unlink()
         except Exception as e:
-            print(f"Error during cleanup: {str(e)}")
+            logger.error(f"Error during cleanup: {str(e)}")

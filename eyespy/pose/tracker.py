@@ -2,7 +2,8 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from ..utils.executor_service import get_executor
+from ..utils.async_utils import run_in_executor
 
 @dataclass
 class TrackedKeypoint:
@@ -26,7 +27,6 @@ class ConfidenceTracker:
         self.max_displacement = max_displacement
         self.confidence_decay = confidence_decay
         self.tracked_keypoints: Dict[str, TrackedKeypoint] = {}
-        self.executor = ThreadPoolExecutor(max_workers=4)
 
     async def update(
         self,
@@ -35,16 +35,9 @@ class ConfidenceTracker:
         """Update tracking with new keypoints"""
         # Process each keypoint in parallel
         tasks = []
-        loop = asyncio.get_event_loop()
 
         for name, (x, y, confidence) in keypoints.items():
-            task = loop.run_in_executor(
-                self.executor,
-                self._process_keypoint,
-                name,
-                (x, y),
-                confidence
-            )
+            task = self._process_keypoint_async(name, (x, y), confidence)
             tasks.append(task)
 
         # Wait for all keypoint processing to complete
@@ -55,6 +48,20 @@ class ConfidenceTracker:
             name: (x, y, conf) 
             for name, (x, y, conf) in zip(keypoints.keys(), processed_keypoints)
         }
+
+    async def _process_keypoint_async(
+        self,
+        name: str,
+        position: Tuple[float, float],
+        confidence: float
+    ) -> Tuple[float, float, float]:
+        """Process a single keypoint asynchronously"""
+        return await run_in_executor(
+            self._process_keypoint,
+            name,
+            position,
+            confidence
+        )
 
     def _process_keypoint(
         self,
@@ -161,7 +168,3 @@ class ConfidenceTracker:
     def reset(self):
         """Reset tracker state"""
         self.tracked_keypoints.clear()
-
-    def __del__(self):
-        """Cleanup executor"""
-        self.executor.shutdown(wait=False)
