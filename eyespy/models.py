@@ -28,3 +28,10 @@ class PoseEstimationResponse(BaseModel):
     )
     validation_metrics: Dict[str, Any] = {} 
     error: Optional[str] = None
+
+class VideoRenderingResponse(BaseModel):
+    status: ProcessingStatus
+    video_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+    error: Optional[str] = None
