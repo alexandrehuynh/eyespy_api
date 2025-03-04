@@ -1,12 +1,14 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from .config import settings
-from .models import PoseEstimationResponse, ProcessingStatus, ConfidenceMetrics, Keypoint, VideoRenderingResponse
+from .models import PoseEstimationResponse, ProcessingStatus, ConfidenceMetrics, Keypoint, VideoRenderingResponse, MovementAnalysisResponse
 from .video import VideoProcessor
-from .video.renderer import VideoRenderer
+from .video.renderer import EnhancedVideoRenderer, RenderingConfig
+from .utils.video_file_manager import VideoFileManager
 from .pose.mediapipe_estimator import MediaPipeEstimator
+from .pose.movement_analyzer import MovementAnalyzer
 import time
 from typing import Optional, Dict, List, Any
 import psutil
@@ -15,7 +17,6 @@ import asyncio
 import numpy as np
 import os
 from pathlib import Path
-from fastapi import Depends
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -34,9 +35,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Create directories for rendered videos
-output_dir = Path(settings.TEMP_DIR) / "rendered"
-output_dir.mkdir(parents=True, exist_ok=True)
+# Initialize shared components
+file_manager = VideoFileManager()
+output_dir = file_manager.rendered_dir
+movement_analyzer = MovementAnalyzer()
 
 # Mount static files directory for serving rendered videos
 app.mount("/videos", StaticFiles(directory=str(output_dir)), name="videos")
@@ -52,6 +54,9 @@ async def process_video(
     max_duration: Optional[int] = None,
     performance_mode: str = "balanced"  # ["fast", "balanced", "quality"]
 ) -> PoseEstimationResponse:
+    """
+    Process a video to extract pose keypoints
+    """
     processing_start = time.time()
     processed_frames = 0
     batch_times = []
@@ -67,8 +72,8 @@ async def process_video(
         )
         pose_estimator = MediaPipeEstimator()
         
-        # Save uploaded video
-        video_path = await video_processor.save_upload(video)
+        # Save uploaded video using file manager
+        video_path = await file_manager.save_upload(video)
         if not video_path:
             logger.error("Failed to save uploaded video")
             raise HTTPException(status_code=400, detail="Unable to save video")
@@ -173,13 +178,15 @@ async def process_video(
         import gc
         gc.collect()
 
-@app.post("/api/v1/render_video", response_model=VideoRenderingResponse)
+@app.post("/api/v1/render", response_model=VideoRenderingResponse)
 async def render_video(
+    background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
-    background_tasks: BackgroundTasks = Depends(BackgroundTasks),
     target_fps: Optional[int] = Query(15, description="Target FPS for processing"),
+    render_mode: str = Query("standard", description="Rendering mode (standard, wireframe, analysis, xray)"),
     show_angles: bool = Query(True, description="Show joint angles in the output"),
     show_analytics: bool = Query(True, description="Show analytics text in the output"),
+    draw_motion_trails: bool = Query(False, description="Draw motion trails for key joints"),
     performance_mode: str = Query("balanced", description="Performance mode (fast, balanced, quality)")
 ) -> VideoRenderingResponse:
     """
@@ -194,15 +201,26 @@ async def render_video(
             min_quality_threshold=0.4 if performance_mode == "fast" else 0.5
         )
         pose_estimator = MediaPipeEstimator()
-        video_renderer = VideoRenderer()
+        
+        # Generate paths
+        paths = file_manager.generate_paths(video)
+        input_path = paths["input"]
+        output_path = paths[render_mode]
         
         # Save uploaded video
-        video_path = await video_processor.save_upload(video)
-        if not video_path:
-            logger.error("Failed to save uploaded video")
-            raise HTTPException(status_code=400, detail="Unable to save video")
+        with open(input_path, "wb") as f:
+            f.write(await video.read())
         
-        logger.info(f"Video saved to: {video_path}")
+        logger.info(f"Video saved to: {input_path}")
+        
+        # Configure video renderer
+        render_config = RenderingConfig(
+            output_dir=file_manager.rendered_dir,
+            show_angles=show_angles,
+            draw_motion_trails=draw_motion_trails,
+            render_mode=render_mode
+        )
+        video_renderer = EnhancedVideoRenderer(render_config)
         
         # Store frames and keypoints for rendering
         all_frames = []
@@ -211,7 +229,7 @@ async def render_video(
         
         # Process frames
         async for frames_chunk, chunk_metadata in video_processor.extract_frames(
-            video_path,
+            input_path,
             target_fps=target_fps
         ):
             if not frames_chunk:
@@ -228,37 +246,42 @@ async def render_video(
         
         # If we have frames and keypoints, render the video
         if all_frames and all_keypoints_per_frame:
-            # Generate output filename
-            output_filename = f"rendered_{int(time.time())}.mp4"
-            
             # Render video
-            output_path = await video_renderer.render_video(
+            output_filename = output_path.name
+            
+            # Perform rendering
+            rendered_path = await video_renderer.render_video(
                 all_frames,
                 all_keypoints_per_frame,
                 metadata,
-                output_filename
+                output_filename,
+                render_mode
             )
             
             # Calculate relative URL
-            relative_url = f"/videos/{os.path.basename(output_path)}"
+            relative_url = f"/videos/{os.path.basename(rendered_path)}"
+            
+            # Generate screenshots
+            screenshots = file_manager.generate_screenshots(Path(rendered_path), count=1)
+            thumbnail_url = f"/videos/screenshots/{screenshots[0].name}" if screenshots else None
+            
+            # Save video info metadata
+            video_info = file_manager.get_video_info(Path(rendered_path))
             
             # Clean up original video file and frames to save space
-            background_tasks.add_task(video_processor.cleanup, video_path)
+            background_tasks.add_task(file_manager.cleanup, [input_path])
             
             return VideoRenderingResponse(
                 status=ProcessingStatus.COMPLETED,
                 video_url=relative_url,
+                thumbnail_url=thumbnail_url,
                 metadata={
                     "processing_time": time.time() - processing_start,
                     "frames_processed": len(all_frames),
                     "original_filename": video.filename,
                     "output_filename": output_filename,
-                    "video_info": {
-                        "fps": metadata.get("fps", 30),
-                        "duration": metadata.get("duration", 0),
-                        "width": all_frames[0].shape[1] if all_frames else 0,
-                        "height": all_frames[0].shape[0] if all_frames else 0
-                    }
+                    "render_mode": render_mode,
+                    "video_info": video_info
                 }
             )
         else:
@@ -269,6 +292,7 @@ async def render_video(
         return VideoRenderingResponse(
             status=ProcessingStatus.FAILED,
             video_url=None,
+            thumbnail_url=None,
             metadata={
                 "processing_time": time.time() - processing_start
             },
@@ -283,12 +307,251 @@ async def render_video(
         import gc
         gc.collect()
 
-@app.get("/api/v1/download_video/{filename}")
+@app.post("/api/v1/analyze", response_model=MovementAnalysisResponse)
+async def analyze_video(
+    video: UploadFile = File(...),
+    target_fps: Optional[int] = None,
+    movement_type: Optional[str] = None,
+    performance_mode: str = "balanced",
+) -> MovementAnalysisResponse:
+    """
+    Analyze a video for movement patterns, form assessment, and repetition counting
+    """
+    processing_start = time.time()
+    
+    try:
+        # Initialize components
+        video_processor = VideoProcessor(
+            process_every_n_frames=2 if performance_mode == "fast" else 1,
+            min_quality_threshold=0.4 if performance_mode == "fast" else 0.5
+        )
+        pose_estimator = MediaPipeEstimator()
+        
+        # Save uploaded video
+        video_path = await file_manager.save_upload(video)
+        if not video_path:
+            logger.error("Failed to save uploaded video")
+            raise HTTPException(status_code=400, detail="Unable to save video")
+        
+        logger.info(f"Video saved to: {video_path}")
+        
+        # Store frames and keypoints for analysis
+        all_keypoints_per_frame = []
+        metadata = {}
+        
+        # Process frames
+        async for frames_chunk, chunk_metadata in video_processor.extract_frames(
+            video_path,
+            target_fps=target_fps
+        ):
+            if not frames_chunk:
+                continue
+                
+            metadata = chunk_metadata
+            
+            # Process frames for pose estimation
+            keypoints_batch = await pose_estimator.process_frames(frames_chunk)
+            
+            # Filter out None frames
+            keypoints_batch = [kps for kps in keypoints_batch if kps is not None]
+            
+            # Store keypoints for analysis
+            all_keypoints_per_frame.extend(keypoints_batch)
+        
+        # If we have keypoints, analyze movement
+        if all_keypoints_per_frame:
+            # Analyze movement
+            movement_analysis = await movement_analyzer.analyze_sequence(all_keypoints_per_frame)
+            
+            # Calculate processing time
+            total_time = time.time() - processing_start
+            
+            return MovementAnalysisResponse(
+                status=ProcessingStatus.COMPLETED,
+                movement_analysis=movement_analysis,
+                metadata={
+                    "processing_time": total_time,
+                    "frames_processed": len(all_keypoints_per_frame),
+                    "video_info": file_manager.get_video_info(video_path)
+                }
+            )
+        else:
+            raise HTTPException(status_code=422, detail="No valid keypoints detected")
+    
+    except Exception as e:
+        logger.error(f"Error analyzing video: {str(e)}")
+        return MovementAnalysisResponse(
+            status=ProcessingStatus.FAILED,
+            movement_analysis=None,
+            metadata={
+                "processing_time": time.time() - processing_start
+            },
+            error=str(e)
+        )
+    finally:
+        # Clean up resources
+        if video_processor:
+            await video_processor.cleanup_resources()
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+
+@app.post("/api/v1/process_complete")
+async def process_complete_video(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    target_fps: Optional[int] = Query(15, description="Target FPS for processing"),
+    render_mode: str = Query("standard", description="Rendering mode (standard, wireframe, analysis, xray)"),
+    show_angles: bool = Query(True, description="Show joint angles in the output"),
+    show_analytics: bool = Query(True, description="Show analytics text in the output"),
+    performance_mode: str = Query("balanced", description="Performance mode (fast, balanced, quality)")
+):
+    """
+    Comprehensive endpoint that processes a video, renders it with skeleton overlay,
+    analyzes movement patterns, and returns all results
+    """
+    processing_start = time.time()
+    
+    try:
+        # Initialize components
+        video_processor = VideoProcessor(
+            process_every_n_frames=2 if performance_mode == "fast" else 1,
+            min_quality_threshold=0.4 if performance_mode == "fast" else 0.5
+        )
+        pose_estimator = MediaPipeEstimator()
+        
+        # Generate paths
+        paths = file_manager.generate_paths(video)
+        input_path = paths["input"]
+        output_path = paths[render_mode]
+        metadata_path = paths["metadata"]
+        
+        # Save uploaded video
+        with open(input_path, "wb") as f:
+            f.write(await video.read())
+        
+        logger.info(f"Video saved to: {input_path}")
+        
+        # Configure video renderer
+        render_config = RenderingConfig(
+            output_dir=file_manager.rendered_dir,
+            show_angles=show_angles,
+            draw_motion_trails=True,
+            render_mode=render_mode
+        )
+        video_renderer = EnhancedVideoRenderer(render_config)
+        
+        # Store frames and keypoints for processing
+        all_frames = []
+        all_keypoints_per_frame = []
+        all_keypoints_flat = []
+        metadata = {}
+        
+        # Process frames
+        async for frames_chunk, chunk_metadata in video_processor.extract_frames(
+            input_path,
+            target_fps=target_fps
+        ):
+            if not frames_chunk:
+                continue
+                
+            metadata = chunk_metadata
+            
+            # Process frames for pose estimation
+            keypoints_batch = await pose_estimator.process_frames(frames_chunk)
+            
+            # Store frames and keypoints
+            all_frames.extend(frames_chunk)
+            all_keypoints_per_frame.extend(keypoints_batch)
+            
+            # Add valid keypoints to flat list
+            for kp_list in keypoints_batch:
+                if kp_list is not None:
+                    all_keypoints_flat.extend(kp_list)
+        
+        # Calculate average confidence
+        avg_confidence = np.mean([kp.confidence for kp in all_keypoints_flat if hasattr(kp, 'confidence')]) if all_keypoints_flat else 0.0
+        
+        # If we have frames and keypoints, complete processing
+        if all_frames and all_keypoints_per_frame:
+            # 1. Render video
+            output_filename = output_path.name
+            rendered_path = await video_renderer.render_video(
+                all_frames,
+                all_keypoints_per_frame,
+                metadata,
+                output_filename,
+                render_mode
+            )
+            
+            # Calculate relative URL
+            video_url = f"/videos/{os.path.basename(rendered_path)}"
+            
+            # Generate screenshots
+            screenshots = file_manager.generate_screenshots(Path(rendered_path), count=1)
+            thumbnail_url = f"/videos/screenshots/{screenshots[0].name}" if screenshots else None
+            
+            # 2. Analyze movement
+            movement_analysis = await movement_analyzer.analyze_sequence(all_keypoints_per_frame)
+            
+            # 3. Combine all results
+            combined_results = {
+                "status": "completed",
+                "video_url": video_url,
+                "thumbnail_url": thumbnail_url,
+                "movement_analysis": movement_analysis,
+                "metadata": {
+                    "processing_time": time.time() - processing_start,
+                    "frames_processed": len(all_frames),
+                    "original_filename": video.filename,
+                    "output_filename": output_filename,
+                    "render_mode": render_mode,
+                    "video_info": file_manager.get_video_info(Path(rendered_path)),
+                    "confidence_metrics": {
+                        "average_confidence": avg_confidence,
+                        "keypoints": {
+                            "processed": len(all_frames),
+                            "detected": len(all_keypoints_flat)
+                        }
+                    }
+                }
+            }
+            
+            # 4. Save metadata
+            file_manager.save_metadata(combined_results, metadata_path)
+            
+            # 5. Clean up temporary files
+            background_tasks.add_task(file_manager.cleanup, [input_path])
+            
+            return combined_results
+        else:
+            raise HTTPException(status_code=422, detail="No valid frames or keypoints detected")
+    
+    except Exception as e:
+        logger.error(f"Error processing video: {str(e)}")
+        return {
+            "status": "failed",
+            "error": str(e),
+            "metadata": {
+                "processing_time": time.time() - processing_start
+            }
+        }
+    finally:
+        # Clean up resources
+        if video_processor:
+            await video_processor.cleanup_resources()
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+
+@app.get("/api/v1/download/{filename}")
 async def download_video(filename: str):
     """
-    Download a rendered video file
+    Download a processed video file
     """
-    file_path = output_dir / filename
+    file_path = file_manager.rendered_dir / filename
     
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Video not found")
@@ -297,4 +560,18 @@ async def download_video(filename: str):
         path=file_path,
         filename=filename,
         media_type="video/mp4"
+    )
+
+@app.get("/api/v1/video_info/{filename}")
+async def get_video_info(filename: str):
+    """
+    Get information about a processed video
+    """
+    file_path = file_manager.rendered_dir / filename
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    return JSONResponse(
+        content=file_manager.get_video_info(file_path)
     )

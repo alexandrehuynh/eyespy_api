@@ -44,14 +44,22 @@ class RenderingConfig:
     # Performance settings
     batch_size: int = 30
     max_workers: int = 4
+    
+    # Visual effects
+    draw_motion_trails: bool = False
+    draw_pelvis_origin: bool = False
+    draw_spine_overlay: bool = False
+    
+    # Video output settings
+    render_mode: str = "standard"  # "standard", "wireframe", "analysis", "xray"
 
     def __post_init__(self):
         """Create output directory if it doesn't exist"""
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
 
-class VideoRenderer:
-    """Renders processed video with skeleton overlay and analytics"""
+class EnhancedVideoRenderer:
+    """Enhanced video renderer with additional visualization options from both projects"""
     
     def __init__(self, config: Optional[RenderingConfig] = None):
         """Initialize the video renderer with optional custom config"""
@@ -91,48 +99,16 @@ class VideoRenderer:
             "right_knee": ("RIGHT_HIP", "RIGHT_KNEE", "RIGHT_ANKLE"),
         }
         
-        # Angle assessment criteria (for analytics)
-        self.angle_assessments = {
-            "elbow": {
-                "normal_range": (10, 160),
-                "messages": {
-                    "low": "Elbow extended too much",
-                    "high": "Elbow bent too much",
-                    "normal": "Good elbow angle"
-                }
-            },
-            "knee": {
-                "normal_range": (10, 170),
-                "messages": {
-                    "low": "Knee extended too much",
-                    "high": "Knee bent too much",
-                    "normal": "Good knee angle"
-                }
-            },
-            "hip": {
-                "normal_range": (80, 160),
-                "messages": {
-                    "low": "Forward hip angle too small",
-                    "high": "Forward hip angle too large",
-                    "normal": "Good hip alignment"
-                }
-            },
-            "shoulder": {
-                "normal_range": (50, 170),
-                "messages": {
-                    "low": "Shoulder rotated too much",
-                    "high": "Shoulder extended too much",
-                    "normal": "Good shoulder alignment"
-                }
-            }
-        }
-    
+        # Store motion history for trails
+        self.motion_trails = {}
+        
     async def render_video(
         self,
         frames: List[np.ndarray],
         keypoints_per_frame: List[List[Keypoint]],
         metadata: Dict[str, Any],
-        output_filename: Optional[str] = None
+        output_filename: Optional[str] = None,
+        render_mode: Optional[str] = None
     ) -> str:
         """
         Render a video with skeleton overlay and analytics
@@ -142,16 +118,20 @@ class VideoRenderer:
             keypoints_per_frame: List of keypoints for each frame
             metadata: Video metadata
             output_filename: Optional filename for the output video
+            render_mode: Rendering mode to use (overrides config)
             
         Returns:
             Path to the rendered video file
         """
         start_time = time.time()
-        logger.info(f"Starting video rendering for {len(frames)} frames")
+        logger.info(f"Starting video rendering for {len(frames)} frames with mode: {render_mode or self.config.render_mode}")
+        
+        # Set render mode (use parameter if provided, otherwise use config)
+        actual_render_mode = render_mode or self.config.render_mode
         
         # Generate output filename if not provided
         if output_filename is None:
-            output_filename = f"rendered_{uuid.uuid4()}.mp4"
+            output_filename = f"rendered_{actual_render_mode}_{uuid.uuid4()}.mp4"
         
         output_path = self.config.output_dir / output_filename
         
@@ -182,11 +162,15 @@ class VideoRenderer:
                 batch_frames = frames[i:i + batch_size]
                 batch_keypoints = keypoints_per_frame[i:i + batch_size]
                 
-                # Render batch in parallel
-                rendered_frames = await self._render_batch(
-                    batch_frames,
-                    batch_keypoints
-                )
+                # Render batch in parallel based on render mode
+                if actual_render_mode == "wireframe":
+                    rendered_frames = await self._render_wireframe_batch(batch_frames, batch_keypoints)
+                elif actual_render_mode == "analysis":
+                    rendered_frames = await self._render_analysis_batch(batch_frames, batch_keypoints)
+                elif actual_render_mode == "xray":
+                    rendered_frames = await self._render_xray_batch(batch_frames, batch_keypoints)
+                else:  # "standard" or fallback
+                    rendered_frames = await self._render_batch(batch_frames, batch_keypoints)
                 
                 # Write frames to video
                 for frame in rendered_frames:
@@ -214,7 +198,7 @@ class VideoRenderer:
         keypoints_per_frame: List[List[Keypoint]]
     ) -> List[np.ndarray]:
         """
-        Render a batch of frames in parallel
+        Render a batch of frames with standard skeleton overlay
         
         Args:
             frames: List of frames to render
@@ -235,13 +219,94 @@ class VideoRenderer:
             *render_tasks
         )
     
+    async def _render_wireframe_batch(
+        self,
+        frames: List[np.ndarray],
+        keypoints_per_frame: List[List[Keypoint]]
+    ) -> List[np.ndarray]:
+        """
+        Render a batch of frames with wireframe visualization
+        
+        Args:
+            frames: List of frames to render
+            keypoints_per_frame: List of keypoints for each frame
+            
+        Returns:
+            List of rendered frames
+        """
+        # Similar to _render_batch but using wireframe rendering
+        render_tasks = []
+        
+        for frame, keypoints in zip(frames, keypoints_per_frame):
+            task = self._render_wireframe_frame(frame.copy(), keypoints)
+            render_tasks.append(task)
+        
+        return await gather_with_concurrency(
+            self.config.max_workers,
+            *render_tasks
+        )
+    
+    async def _render_analysis_batch(
+        self,
+        frames: List[np.ndarray],
+        keypoints_per_frame: List[List[Keypoint]]
+    ) -> List[np.ndarray]:
+        """
+        Render a batch of frames with detailed analysis visualization
+        
+        Args:
+            frames: List of frames to render
+            keypoints_per_frame: List of keypoints for each frame
+            
+        Returns:
+            List of rendered frames
+        """
+        # Similar to _render_batch but using analysis rendering
+        render_tasks = []
+        
+        for frame, keypoints in zip(frames, keypoints_per_frame):
+            task = self._render_analysis_frame(frame.copy(), keypoints)
+            render_tasks.append(task)
+        
+        return await gather_with_concurrency(
+            self.config.max_workers,
+            *render_tasks
+        )
+    
+    async def _render_xray_batch(
+        self,
+        frames: List[np.ndarray],
+        keypoints_per_frame: List[List[Keypoint]]
+    ) -> List[np.ndarray]:
+        """
+        Render a batch of frames with X-ray style visualization
+        
+        Args:
+            frames: List of frames to render
+            keypoints_per_frame: List of keypoints for each frame
+            
+        Returns:
+            List of rendered frames
+        """
+        # Similar to _render_batch but using X-ray rendering
+        render_tasks = []
+        
+        for frame, keypoints in zip(frames, keypoints_per_frame):
+            task = self._render_xray_frame(frame.copy(), keypoints)
+            render_tasks.append(task)
+        
+        return await gather_with_concurrency(
+            self.config.max_workers,
+            *render_tasks
+        )
+    
     async def _render_frame(
         self,
         frame: np.ndarray,
         keypoints: List[Keypoint]
     ) -> np.ndarray:
         """
-        Render a single frame with skeleton overlay and analytics
+        Render a single frame with skeleton overlay
         
         Args:
             frame: Video frame
@@ -291,7 +356,312 @@ class VideoRenderer:
             # Add analytics based on angles
             self._add_analytics_text(frame, angle_results)
         
+        # Optional: Draw motion trails
+        if self.config.draw_motion_trails:
+            frame = self._draw_motion_trails(frame, keypoint_dict)
+            
+        # Optional: Draw pelvis origin
+        if self.config.draw_pelvis_origin:
+            frame = self._draw_pelvis_origin(frame, keypoint_dict)
+            
+        # Optional: Draw spine overlay
+        if self.config.draw_spine_overlay:
+            frame = self._draw_spine_overlay(frame, keypoint_dict)
+        
         return frame
+    
+    async def _render_wireframe_frame(
+        self,
+        frame: np.ndarray,
+        keypoints: List[Keypoint]
+    ) -> np.ndarray:
+        """Render a frame with wireframe visualization"""
+        return await run_in_executor(
+            self._render_wireframe_frame_sync,
+            frame,
+            keypoints
+        )
+    
+    def _render_wireframe_frame_sync(
+        self,
+        frame: np.ndarray,
+        keypoints: List[Keypoint]
+    ) -> np.ndarray:
+        """Wireframe visualization (from backend_fresh)"""
+        # Create a black canvas
+        height, width = frame.shape[:2]
+        wireframe = np.zeros((height, width, 3), dtype=np.uint8)
+        
+        # Skip if no keypoints
+        if not keypoints:
+            return wireframe
+        
+        # Convert keypoints to dictionary
+        keypoint_dict = {kp.name: kp for kp in keypoints}
+        
+        # Draw wireframe skeleton with bright colors
+        for p1_name, p2_name in self.skeleton_connections:
+            if p1_name in keypoint_dict and p2_name in keypoint_dict:
+                p1 = keypoint_dict[p1_name]
+                p2 = keypoint_dict[p2_name]
+                
+                # Skip if confidence is too low
+                if p1.confidence < 0.5 or p2.confidence < 0.5:
+                    continue
+                
+                # Convert normalized coordinates to pixel coordinates
+                p1_px = (int(p1.x * width), int(p1.y * height))
+                p2_px = (int(p2.x * width), int(p2.y * height))
+                
+                # Draw bright lines
+                cv2.line(wireframe, p1_px, p2_px, (0, 255, 255), 3)
+        
+        # Draw joints
+        for name, kp in keypoint_dict.items():
+            if kp.confidence < 0.5:
+                continue
+                
+            x_px = int(kp.x * width)
+            y_px = int(kp.y * height)
+            
+            # Draw larger circles for joints
+            cv2.circle(wireframe, (x_px, y_px), 6, (255, 255, 0), -1)
+            
+        # Add angles for key joints
+        angle_results = self._calculate_angles(keypoint_dict)
+        for joint_name, angle in angle_results.items():
+            if "elbow" in joint_name or "knee" in joint_name:
+                landmark_name = joint_name.replace("left_", "LEFT_").replace("right_", "RIGHT_").replace("elbow", "ELBOW").replace("knee", "KNEE")
+                if landmark_name in keypoint_dict:
+                    kp = keypoint_dict[landmark_name]
+                    x_px = int(kp.x * width) + 10
+                    y_px = int(kp.y * height) + 10
+                    cv2.putText(wireframe, f"{angle:.1f}°", (x_px, y_px), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        return wireframe
+    
+    async def _render_analysis_frame(
+        self,
+        frame: np.ndarray,
+        keypoints: List[Keypoint]
+    ) -> np.ndarray:
+        """Render a frame with detailed analysis visualization"""
+        return await run_in_executor(
+            self._render_analysis_frame_sync,
+            frame,
+            keypoints
+        )
+    
+    def _render_analysis_frame_sync(
+        self,
+        frame: np.ndarray,
+        keypoints: List[Keypoint]
+    ) -> np.ndarray:
+        """Analysis visualization (combination of standard and additional metrics)"""
+        # First draw standard skeleton
+        rendered = self._render_frame_sync(frame, keypoints)
+        
+        # Skip if no keypoints
+        if not keypoints:
+            return rendered
+        
+        # Convert keypoints to dictionary
+        keypoint_dict = {kp.name: kp for kp in keypoints}
+        
+        # Add large analytics panel
+        height, width = frame.shape[:2]
+        overlay = rendered.copy()
+        cv2.rectangle(overlay, (width-350, 0), (width, 400), (0, 0, 0), -1)
+        alpha = 0.7
+        cv2.addWeighted(overlay, alpha, rendered, 1 - alpha, 0, rendered)
+        
+        # Calculate joint angles
+        angles = self._calculate_angles(keypoint_dict)
+        
+        # Add detailed analytics text
+        cv2.putText(rendered, "MOVEMENT ANALYSIS", (width-340, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        # Joint angles
+        y_offset = 70
+        for joint, angle in angles.items():
+            color = (0, 255, 0) if self._is_angle_in_range(joint, angle) else (0, 0, 255)
+            cv2.putText(rendered, f"{joint}: {angle:.1f}°", (width-340, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            y_offset += 30
+        
+        # Form assessment
+        y_offset += 20
+        cv2.putText(rendered, "FORM ASSESSMENT", (width-340, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        y_offset += 30
+        
+        # Add form assessment based on angles
+        form_issues = self._assess_form(angles)
+        if form_issues:
+            for issue in form_issues[:3]:  # Show up to 3 issues
+                cv2.putText(rendered, f"- {issue}", (width-340, y_offset), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                y_offset += 25
+        else:
+            cv2.putText(rendered, "- Good form", (width-340, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        return rendered
+    
+    async def _render_xray_frame(
+        self,
+        frame: np.ndarray,
+        keypoints: List[Keypoint]
+    ) -> np.ndarray:
+        """Render a frame with X-ray style visualization"""
+        return await run_in_executor(
+            self._render_xray_frame_sync,
+            frame,
+            keypoints
+        )
+    
+    def _render_xray_frame_sync(
+        self,
+        frame: np.ndarray,
+        keypoints: List[Keypoint]
+    ) -> np.ndarray:
+        """X-ray style visualization (dark background with glowing skeleton)"""
+        # Create a dark version of the original frame
+        height, width = frame.shape[:2]
+        xray = cv2.addWeighted(frame, 0.2, np.zeros_like(frame), 0.8, 0)
+        
+        # Skip if no keypoints
+        if not keypoints:
+            return xray
+        
+        # Convert keypoints to dictionary
+        keypoint_dict = {kp.name: kp for kp in keypoints}
+        
+        # Create a black canvas for the skeleton
+        skeleton_canvas = np.zeros_like(frame)
+        
+        # Draw thick bright lines for skeleton
+        for p1_name, p2_name in self.skeleton_connections:
+            if p1_name in keypoint_dict and p2_name in keypoint_dict:
+                p1 = keypoint_dict[p1_name]
+                p2 = keypoint_dict[p2_name]
+                
+                # Skip if confidence is too low
+                if p1.confidence < 0.4 or p2.confidence < 0.4:
+                    continue
+                
+                # Convert normalized coordinates to pixel coordinates
+                p1_px = (int(p1.x * width), int(p1.y * height))
+                p2_px = (int(p2.x * width), int(p2.y * height))
+                
+                # Draw thick bright lines
+                cv2.line(skeleton_canvas, p1_px, p2_px, (0, 255, 255), 4)
+        
+        # Draw joints
+        for name, kp in keypoint_dict.items():
+            if kp.confidence < 0.4:
+                continue
+                
+            x_px = int(kp.x * width)
+            y_px = int(kp.y * height)
+            
+            # Draw larger circles for joints
+            cv2.circle(skeleton_canvas, (x_px, y_px), 8, (0, 255, 255), -1)
+        
+        # Apply blur for glow effect
+        skeleton_glow = cv2.GaussianBlur(skeleton_canvas, (15, 15), 0)
+        
+        # Overlay the glowing skeleton on the dark frame
+        result = cv2.addWeighted(xray, 1.0, skeleton_glow, 1.0, 0)
+        
+        return result
+    
+    def _calculate_angles(self, keypoint_dict: Dict[str, Keypoint]) -> Dict[str, float]:
+        """Calculate joint angles from keypoints"""
+        angles = {}
+        
+        for angle_name, (p1_name, p2_name, p3_name) in self.angle_definitions.items():
+            if all(p_name in keypoint_dict for p_name in [p1_name, p2_name, p3_name]):
+                p1 = keypoint_dict[p1_name]
+                p2 = keypoint_dict[p2_name]
+                p3 = keypoint_dict[p3_name]
+                
+                # Skip if confidence is too low
+                if p1.confidence < 0.5 or p2.confidence < 0.5 or p3.confidence < 0.5:
+                    continue
+                
+                # Calculate angle
+                angle = self._calculate_angle(p1, p2, p3)
+                angles[angle_name] = angle
+                
+        return angles
+    
+    def _calculate_angle(self, p1: Keypoint, p2: Keypoint, p3: Keypoint) -> float:
+        """Calculate angle between three points"""
+        # Convert to numpy arrays
+        a = np.array([p1.x, p1.y])
+        b = np.array([p2.x, p2.y])
+        c = np.array([p3.x, p3.y])
+        
+        # Calculate vectors
+        ba = a - b
+        bc = c - b
+        
+        # Calculate cosine of angle
+        cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-10)
+        
+        # Calculate angle
+        angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+        
+        return np.degrees(angle)
+    
+    def _is_angle_in_range(self, joint_name: str, angle: float) -> bool:
+        """Check if angle is in normal range for the joint"""
+        ranges = {
+            'left_elbow': (10, 160),
+            'right_elbow': (10, 160),
+            'left_knee': (10, 170),
+            'right_knee': (10, 170),
+            'left_hip': (80, 160),
+            'right_hip': (80, 160),
+            'left_shoulder': (50, 170),
+            'right_shoulder': (50, 170)
+        }
+        
+        if joint_name in ranges:
+            min_val, max_val = ranges[joint_name]
+            return min_val <= angle <= max_val
+        
+        return True
+    
+    def _assess_form(self, angles: Dict[str, float]) -> List[str]:
+        """Assess form based on joint angles"""
+        issues = []
+        
+        # Check knee angles
+        if 'left_knee' in angles and angles['left_knee'] < 10:
+            issues.append("Left knee hyperextended")
+        if 'right_knee' in angles and angles['right_knee'] < 10:
+            issues.append("Right knee hyperextended")
+            
+        # Check knee alignment
+        if 'left_knee' in angles and 'right_knee' in angles:
+            if abs(angles['left_knee'] - angles['right_knee']) > 15:
+                issues.append("Uneven knee bend")
+                
+        # Check hip alignment
+        if 'left_hip' in angles and 'right_hip' in angles:
+            if abs(angles['left_hip'] - angles['right_hip']) > 15:
+                issues.append("Uneven hip position")
+                
+        # Check shoulder alignment
+        if 'left_shoulder' in angles and 'right_shoulder' in angles:
+            if abs(angles['left_shoulder'] - angles['right_shoulder']) > 15:
+                issues.append("Uneven shoulder position")
+                
+        return issues
     
     def _draw_skeleton(
         self,
@@ -414,38 +784,6 @@ class VideoRenderer:
         
         return angle_results
     
-    def _calculate_angle(
-        self,
-        p1: Keypoint,
-        p2: Keypoint,
-        p3: Keypoint
-    ) -> float:
-        """
-        Calculate the angle between three points
-        
-        Args:
-            p1: First point
-            p2: Middle point (apex of the angle)
-            p3: Third point
-            
-        Returns:
-            Angle in degrees
-        """
-        # Convert to numpy arrays
-        a = np.array([p1.x, p1.y])
-        b = np.array([p2.x, p2.y])
-        c = np.array([p3.x, p3.y])
-        
-        # Calculate vectors
-        ba = a - b
-        bc = c - b
-        
-        # Calculate angle
-        cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-        angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
-        
-        return np.degrees(angle)
-    
     def _add_analytics_text(
         self,
         frame: np.ndarray,
@@ -498,18 +836,35 @@ class VideoRenderer:
             if angles:
                 avg_angle = sum(angles) / len(angles)
                 
-                # Get assessment criteria
-                criteria = self.angle_assessments.get(joint_type, {})
-                normal_range = criteria.get("normal_range", (0, 180))
-                messages = criteria.get("messages", {})
-                
-                # Determine assessment
-                if avg_angle < normal_range[0]:
-                    assessment = messages.get("low", "Below normal range")
-                elif avg_angle > normal_range[1]:
-                    assessment = messages.get("high", "Above normal range")
-                else:
-                    assessment = messages.get("normal", "Within normal range")
+                # Get assessment message
+                if joint_type == "elbow":
+                    if avg_angle < 10:
+                        assessment = "Arm too straight"
+                    elif avg_angle > 160:
+                        assessment = "Arm too bent"
+                    else:
+                        assessment = "Good elbow position"
+                elif joint_type == "knee":
+                    if avg_angle < 10:
+                        assessment = "Knee locked"
+                    elif avg_angle > 170:
+                        assessment = "Knee too bent"
+                    else:
+                        assessment = "Good knee position"
+                elif joint_type == "hip":
+                    if avg_angle < 80:
+                        assessment = "Hip too bent"
+                    elif avg_angle > 160:
+                        assessment = "Hip too straight"
+                    else:
+                        assessment = "Good hip position"
+                elif joint_type == "shoulder":
+                    if avg_angle < 50:
+                        assessment = "Shoulder too forward"
+                    elif avg_angle > 170:
+                        assessment = "Shoulder too back"
+                    else:
+                        assessment = "Good shoulder position"
             
             # Add assessment text
             cv2.putText(
@@ -523,46 +878,249 @@ class VideoRenderer:
             )
             
             y_offset += 20
-    
-    async def create_thumbnail(
+        
+    def _draw_motion_trails(
         self,
-        video_path: str,
-        keypoints: List[Keypoint]
-    ) -> str:
+        frame: np.ndarray,
+        keypoint_dict: Dict[str, Keypoint]
+    ) -> np.ndarray:
         """
-        Create a thumbnail image with skeleton overlay
+        Draw motion trails for tracked keypoints
         
         Args:
-            video_path: Path to the video file
-            keypoints: List of keypoints for the thumbnail frame
+            frame: Video frame
+            keypoint_dict: Dictionary of keypoints
             
         Returns:
-            Path to the thumbnail image
+            Frame with motion trails
         """
-        # Generate thumbnail filename
-        thumbnail_filename = f"thumbnail_{uuid.uuid4()}.jpg"
-        thumbnail_path = self.config.output_dir / thumbnail_filename
+        height, width = frame.shape[:2]
         
-        # Open video to extract a frame
-        cap = cv2.VideoCapture(video_path)
+        # Key points to track for trails
+        trail_points = [
+            "LEFT_WRIST", "RIGHT_WRIST",  # Hands
+            "LEFT_ANKLE", "RIGHT_ANKLE",  # Feet
+            "NOSE"                         # Head
+        ]
         
-        try:
-            # Extract middle frame
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count // 2)
-            ret, frame = cap.read()
+        # Update motion trails
+        for point_name in trail_points:
+            if point_name in keypoint_dict and keypoint_dict[point_name].confidence > 0.5:
+                kp = keypoint_dict[point_name]
+                pos = (int(kp.x * width), int(kp.y * height))
+                
+                if point_name not in self.motion_trails:
+                    self.motion_trails[point_name] = []
+                
+                self.motion_trails[point_name].append(pos)
+                
+                # Limit trail length
+                if len(self.motion_trails[point_name]) > self.config.batch_size:
+                    self.motion_trails[point_name].pop(0)
+        
+        # Draw trails
+        for point_name, trail in self.motion_trails.items():
+            if len(trail) >= 2:
+                for i in range(1, len(trail)):
+                    # Fade color based on position in trail
+                    alpha = i / len(trail)
+                    
+                    if "WRIST" in point_name:
+                        color = (0, int(255 * alpha), int(255 * (1 - alpha)))  # Yellow to cyan
+                    elif "ANKLE" in point_name:
+                        color = (int(255 * (1 - alpha)), int(255 * alpha), 0)  # Green to yellow
+                    else:
+                        color = (int(255 * alpha), 0, int(255 * (1 - alpha)))  # Purple to blue
+                    
+                    cv2.line(frame, trail[i-1], trail[i], color, 2)
+        
+        return frame
+    
+    def _draw_pelvis_origin(
+        self,
+        frame: np.ndarray,
+        keypoint_dict: Dict[str, Keypoint]
+    ) -> np.ndarray:
+        """
+        Draw pelvis origin and coordinate axes
+        
+        Args:
+            frame: Video frame
+            keypoint_dict: Dictionary of keypoints
             
-            if not ret:
-                logger.error("Failed to extract frame for thumbnail")
-                return ""
+        Returns:
+            Frame with pelvis origin visualization
+        """
+        height, width = frame.shape[:2]
+        
+        # Check if required keypoints are available
+        if not all(k in keypoint_dict for k in ["LEFT_HIP", "RIGHT_HIP"]):
+            return frame
             
-            # Render the frame with skeleton
-            rendered_frame = await self._render_frame(frame, keypoints)
+        left_hip = keypoint_dict["LEFT_HIP"]
+        right_hip = keypoint_dict["RIGHT_HIP"]
+        
+        # Skip if confidence is too low
+        if left_hip.confidence < 0.5 or right_hip.confidence < 0.5:
+            return frame
             
-            # Save the thumbnail
-            cv2.imwrite(str(thumbnail_path), rendered_frame)
+        # Calculate pelvis origin
+        left_hip_px = (int(left_hip.x * width), int(left_hip.y * height))
+        right_hip_px = (int(right_hip.x * width), int(right_hip.y * height))
+        
+        pelvis_origin = (
+            (left_hip_px[0] + right_hip_px[0]) // 2,
+            (left_hip_px[1] + right_hip_px[1]) // 2
+        )
+        
+        # Create overlay for axes
+        overlay = frame.copy()
+        
+        # Draw 3D axes
+        axis_length = int(min(width, height) * 0.2)
+        
+        # X-axis (red)
+        cv2.line(
+            overlay,
+            pelvis_origin,
+            (pelvis_origin[0] + axis_length, pelvis_origin[1]),
+            (0, 0, 255),
+            2
+        )
+        cv2.putText(
+            overlay,
+            "X",
+            (pelvis_origin[0] + axis_length + 10, pelvis_origin[1]),
+            self.config.font,
+            self.config.font_scale,
+            (0, 0, 255),
+            self.config.font_thickness
+        )
+        
+        # Y-axis (green)
+        cv2.line(
+            overlay,
+            pelvis_origin,
+            (pelvis_origin[0], pelvis_origin[1] - axis_length),
+            (0, 255, 0),
+            2
+        )
+        cv2.putText(
+            overlay,
+            "Y",
+            (pelvis_origin[0], pelvis_origin[1] - axis_length - 10),
+            self.config.font,
+            self.config.font_scale,
+            (0, 255, 0),
+            self.config.font_thickness
+        )
+        
+        # Z-axis (blue)
+        cv2.line(
+            overlay,
+            pelvis_origin,
+            (pelvis_origin[0], pelvis_origin[1] + axis_length),
+            (255, 0, 0),
+            2
+        )
+        cv2.putText(
+            overlay,
+            "Z",
+            (pelvis_origin[0], pelvis_origin[1] + axis_length + 20),
+            self.config.font,
+            self.config.font_scale,
+            (255, 0, 0),
+            self.config.font_thickness
+        )
+        
+        # Apply overlay with transparency
+        alpha = 0.5
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        
+        return frame
+    
+    def _draw_spine_overlay(
+        self,
+        frame: np.ndarray,
+        keypoint_dict: Dict[str, Keypoint]
+    ) -> np.ndarray:
+        """
+        Draw spine overlay connecting shoulders to hips
+        
+        Args:
+            frame: Video frame
+            keypoint_dict: Dictionary of keypoints
             
-            return str(thumbnail_path)
+        Returns:
+            Frame with spine overlay
+        """
+        height, width = frame.shape[:2]
+        
+        # Check if required keypoints are available
+        if not all(k in keypoint_dict for k in [
+            "LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"
+        ]):
+            return frame
             
-        finally:
-            cap.release()
+        left_shoulder = keypoint_dict["LEFT_SHOULDER"]
+        right_shoulder = keypoint_dict["RIGHT_SHOULDER"]
+        left_hip = keypoint_dict["LEFT_HIP"]
+        right_hip = keypoint_dict["RIGHT_HIP"]
+        
+        # Skip if confidence is too low
+        if (left_shoulder.confidence < 0.5 or right_shoulder.confidence < 0.5 or
+            left_hip.confidence < 0.5 or right_hip.confidence < 0.5):
+            return frame
+            
+        # Calculate midpoints
+        left_shoulder_px = (int(left_shoulder.x * width), int(left_shoulder.y * height))
+        right_shoulder_px = (int(right_shoulder.x * width), int(right_shoulder.y * height))
+        left_hip_px = (int(left_hip.x * width), int(left_hip.y * height))
+        right_hip_px = (int(right_hip.x * width), int(right_hip.y * height))
+        
+        shoulder_midpoint = (
+            (left_shoulder_px[0] + right_shoulder_px[0]) // 2,
+            (left_shoulder_px[1] + right_shoulder_px[1]) // 2
+        )
+        
+        hip_midpoint = (
+            (left_hip_px[0] + right_hip_px[0]) // 2,
+            (left_hip_px[1] + right_hip_px[1]) // 2
+        )
+        
+        # Generate spine points
+        spine_points = []
+        num_points = 5
+        
+        for i in range(num_points + 1):
+            t = i / num_points
+            x = int((1 - t) * shoulder_midpoint[0] + t * hip_midpoint[0])
+            y = int((1 - t) * shoulder_midpoint[1] + t * hip_midpoint[1])
+            spine_points.append((x, y))
+        
+        # Draw spine segments
+        for i in range(len(spine_points) - 1):
+            cv2.line(
+                frame,
+                spine_points[i],
+                spine_points[i + 1],
+                (0, 255, 0),
+                2
+            )
+            cv2.circle(
+                frame,
+                spine_points[i],
+                3,
+                (255, 255, 255),
+                -1
+            )
+            
+        cv2.circle(
+            frame,
+            spine_points[-1],
+            3,
+            (255, 255, 255),
+            -1
+        )
+        
+        return frame

@@ -298,4 +298,5 @@ Frame failed quality thresholds:
 
     def __del__(self):
         """Cleanup executor on deletion"""
-        self.executor.shutdown(wait=False)
+        if hasattr(self, 'executor'): 
+            self.executor.shutdown(wait=False)

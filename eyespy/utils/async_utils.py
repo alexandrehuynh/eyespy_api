@@ -20,7 +20,7 @@ async def run_in_executor(func: Callable[..., T], *args, **kwargs) -> T:
     Returns:
         The result of the function execution
     """
-    loop = asyncio.get_running_loop()
+    loop = asyncio.get_event_loop()
     
     # Use partial to combine the function with its arguments
     if kwargs:
@@ -29,9 +29,11 @@ async def run_in_executor(func: Callable[..., T], *args, **kwargs) -> T:
         func_to_run = lambda: func(*args)
     
     try:
-        return await loop.run_in_executor(get_executor(), func_to_run)
+        return await loop.run_in_executor(
+            None, functools.partial(func_to_run)
+        )
     except Exception as e:
-        logger.error(f"Error executing {func.__name__} in executor: {str(e)}")
+        logger.error(f"Error executing {func.__name__} in executor: {e}")
         raise
 
 async def gather_with_concurrency(n: int, *tasks) -> list:
@@ -75,4 +77,32 @@ def run_sync(func: Callable[..., Coroutine]) -> Callable[..., Any]:
         
         return loop.run_until_complete(func(*args, **kwargs))
     
+    return wrapper
+
+def none_safe(func):
+    """Decorator to safely handle None inputs.
+    
+    Prevents 'NoneType' object is not iterable errors by checking inputs
+    before processing.
+    
+    Args:
+        func: The function to decorate.
+        
+    Returns:
+        A wrapped function that checks for None inputs.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        # Check if any positional args are None
+        if any(arg is None for arg in args):
+            logger.warning(f"None value passed to {func.__name__}, returning None")
+            return None
+            
+        # Check if any keyword args are None for known iterable parameters
+        for param_name, value in kwargs.items():
+            if value is None and param_name in ('keypoints', 'points', 'coordinates', 'data'):
+                logger.warning(f"None value for {param_name} passed to {func.__name__}, returning None")
+                return None
+                
+        return func(*args, **kwargs)
     return wrapper

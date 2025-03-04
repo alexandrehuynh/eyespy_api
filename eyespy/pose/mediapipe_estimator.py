@@ -25,7 +25,9 @@ class MediaPipeEstimator:
             static_image_mode=False,
             model_complexity=2,
             min_detection_confidence=settings.GLOBAL_CONFIDENCE_THRESHOLD,
-            min_tracking_confidence=settings.GLOBAL_CONFIDENCE_THRESHOLD
+            min_tracking_confidence=settings.GLOBAL_CONFIDENCE_THRESHOLD,
+            smooth_segmentation=True,
+            enable_segmentation=True
         )
         
         # Thresholds and validators
@@ -71,10 +73,15 @@ class MediaPipeEstimator:
         self,
         batch: List[np.ndarray]
     ) -> List[Optional[List[Keypoint]]]:
-        """Process a batch of frames with MediaPipe"""
-        # Process frames in parallel using asyncio.gather
-        tasks = [self._process_single_frame(frame) for frame in batch]
-        return await asyncio.gather(*tasks)
+        """Process a batch of frames with MediaPipe sequentially"""
+        results = []
+        for i, frame in enumerate(batch):
+            # Process one frame at a time in strict order
+            result = await self._process_single_frame(frame)
+            results.append(result)
+            # Give more time for event loop
+            await asyncio.sleep(0.001)  # Slight delay to prevent timestamp issues
+        return results
 
     async def _process_single_frame(self, frame: np.ndarray) -> Optional[List[Keypoint]]:
         """Process a single frame with MediaPipe"""
@@ -159,12 +166,11 @@ class MediaPipeEstimator:
         """Cleanup resources with proper error handling"""
         try:
             if hasattr(self, 'pose'):
-                # Add a short delay to ensure all processing is complete
+                # Use a small synchronous delay instead of asyncio.sleep
+                # This avoids the "coroutine was never awaited" warning
                 try:
-                    import asyncio
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        loop.run_until_complete(asyncio.sleep(0.1))
+                    import time
+                    time.sleep(0.1)  # Use time.sleep instead of asyncio.sleep
                 except:
                     pass
                     
