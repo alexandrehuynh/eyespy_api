@@ -58,7 +58,7 @@ class RenderingConfig:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
 
-class EnhancedVideoRenderer:
+class VideoRenderer:
     """Enhanced video renderer with additional visualization options from both projects"""
     
     def __init__(self, config: Optional[RenderingConfig] = None):
@@ -194,11 +194,11 @@ class EnhancedVideoRenderer:
     
     async def _render_batch(
         self,
-        frames: List[np.ndarray],
-        keypoints_per_frame: List[List[Keypoint]]
+        batch_frames: List[np.ndarray],
+        batch_keypoints: List[List[Keypoint]]
     ) -> List[np.ndarray]:
         """
-        Render a batch of frames with standard skeleton overlay
+        Render a batch of frames sequentially with standard skeleton overlay
         
         Args:
             frames: List of frames to render
@@ -207,17 +207,17 @@ class EnhancedVideoRenderer:
         Returns:
             List of rendered frames
         """
-        # Use gather with concurrency to limit parallel processing
-        render_tasks = []
+        rendered_frames = []
+    
+        # Process each frame sequentially instead of concurrently
+        for i, (frame, keypoints) in enumerate(zip(batch_frames, batch_keypoints)):
+            rendered_frame = await self._render_frame(frame, keypoints)
+            rendered_frames.append(rendered_frame)
+            
+            # Small delay to yield control
+            await asyncio.sleep(0.001)
         
-        for frame, keypoints in zip(frames, keypoints_per_frame):
-            task = self._render_frame(frame.copy(), keypoints)
-            render_tasks.append(task)
-        
-        return await gather_with_concurrency(
-            self.config.max_workers,
-            *render_tasks
-        )
+        return rendered_frames
     
     async def _render_wireframe_batch(
         self,
@@ -436,7 +436,7 @@ class EnhancedVideoRenderer:
                     kp = keypoint_dict[landmark_name]
                     x_px = int(kp.x * width) + 10
                     y_px = int(kp.y * height) + 10
-                    cv2.putText(wireframe, f"{angle:.1f}°", (x_px, y_px), 
+                    cv2.putText(wireframe, f"{angle:.1f}", (x_px, y_px), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return wireframe
@@ -487,7 +487,7 @@ class EnhancedVideoRenderer:
         y_offset = 70
         for joint, angle in angles.items():
             color = (0, 255, 0) if self._is_angle_in_range(joint, angle) else (0, 0, 255)
-            cv2.putText(rendered, f"{joint}: {angle:.1f}°", (width-340, y_offset), 
+            cv2.putText(rendered, f"{joint}: {angle:.1f}", (width-340, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             y_offset += 30
         
@@ -774,7 +774,7 @@ class EnhancedVideoRenderer:
                 # Draw angle text
                 cv2.putText(
                     frame,
-                    f"{angle:.1f}°",
+                    f"{angle:.1f}",
                     (p2_px[0] + 10, p2_px[1] + 10),
                     self.config.font,
                     self.config.font_scale,

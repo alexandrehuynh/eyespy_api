@@ -21,13 +21,12 @@ class MediaPipeEstimator:
     def __init__(self):
         # MediaPipe initialization
         self.mp_pose = mp.solutions.pose
+
         self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
+            static_image_mode=True,
             model_complexity=2,
             min_detection_confidence=settings.GLOBAL_CONFIDENCE_THRESHOLD,
-            min_tracking_confidence=settings.GLOBAL_CONFIDENCE_THRESHOLD,
-            smooth_segmentation=True,
-            enable_segmentation=True
+            min_tracking_confidence=settings.GLOBAL_CONFIDENCE_THRESHOLD
         )
         
         # Thresholds and validators
@@ -41,60 +40,70 @@ class MediaPipeEstimator:
         
         # Add performance monitoring
         self.processing_times = []
+        
+        # Log MediaPipe version
+        logger.info(f"Using MediaPipe version: {mp.__version__}")
 
     async def process_frames(
         self,
         frames: List[np.ndarray],
         batch_size: Optional[int] = None
     ) -> List[Optional[List[Keypoint]]]:
-        """Process frames using optimized batching"""
+        """Process frames sequentially to maintain timestamp order"""
         if batch_size is None:
             batch_size = self.batch_size
             
         total_frames = len(frames)
-        tasks = []
+        all_keypoints = []
         
-        # Create all tasks at once
+        logger.info(f"Starting to process {total_frames} frames sequentially")
+        
+        # Process frames in strict sequential order, batch by batch
         for i in range(0, total_frames, batch_size):
             batch = frames[i:i + batch_size]
-            tasks.append(self._process_batch(batch))
-        
-        # Process all batches concurrently
-        results = await asyncio.gather(*tasks)
-        
-        # Flatten results
-        all_keypoints = []
-        for batch_keypoints in results:
+            logger.info(f"Processing batch {i//batch_size + 1}/{(total_frames+batch_size-1)//batch_size}")
+            
+            # Process one batch at a time
+            batch_keypoints = await self._process_batch(batch)
             all_keypoints.extend(batch_keypoints)
+            
+            # Small delay between batches to prevent event loop congestion
+            await asyncio.sleep(0.001)
         
         return all_keypoints
 
-    async def _process_batch(
-        self,
-        batch: List[np.ndarray]
-    ) -> List[Optional[List[Keypoint]]]:
-        """Process a batch of frames with MediaPipe sequentially"""
+    async def _process_batch(self, batch: List[np.ndarray]) -> List[Optional[List[Keypoint]]]:
+        """Process batch frames sequentially to maintain timestamp order"""
         results = []
+        
+        # Process each frame in the batch sequentially with a small delay
         for i, frame in enumerate(batch):
-            # Process one frame at a time in strict order
+            logger.debug(f"Processing frame {i} in batch")
             result = await self._process_single_frame(frame)
             results.append(result)
-            # Give more time for event loop
-            await asyncio.sleep(0.001)  # Slight delay to prevent timestamp issues
+            
+            # Increase the delay to give MediaPipe more time between frames
+            await asyncio.sleep(0.01)  # Increased from 0.001
+        
         return results
 
     async def _process_single_frame(self, frame: np.ndarray) -> Optional[List[Keypoint]]:
         """Process a single frame with MediaPipe"""
         try:
+            start_time = time.time()
             # Convert BGR to RGB
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
+            logger.debug(f"Sending frame to MediaPipe, size: {frame.shape}")
             # Process the frame with MediaPipe using shared executor
             results = await run_in_executor(self.pose.process, rgb_frame)
-            
+            process_time = time.time() - start_time
+
             if not results.pose_landmarks:
+                logger.debug(f"No pose landmarks detected, processing took {process_time:.3f}s")
                 return None
             
+            logger.debug(f"Got pose landmarks, processing took {process_time:.3f}s")
             # Convert landmarks to keypoints
             keypoints = [
                 Keypoint(

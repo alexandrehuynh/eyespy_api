@@ -545,7 +545,7 @@ class SkeletonDrawer:
                 
                 cv2.putText(
                     frame,
-                    f"{angle:.1f}°",
+                    f"{angle:.1f}",
                     (text_x, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,

@@ -542,8 +542,8 @@ class MovementAnalyzer:
         }
 
         if keypoints is None or not keypoints:  # Check if None or empty
-            return {}  # Return empty dictionary instead of list
-        
+            return {}  # Return empty dictionary instead of proceeding with None
+    
         # Convert keypoints to dictionary for easier access
         keypoint_dict = {kp.name: kp for kp in keypoints}
         

@@ -30,7 +30,7 @@ async def run_in_executor(func: Callable[..., T], *args, **kwargs) -> T:
     
     try:
         return await loop.run_in_executor(
-            None, functools.partial(func_to_run)
+            get_executor(), func_to_run
         )
     except Exception as e:
         logger.error(f"Error executing {func.__name__} in executor: {e}")

@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import settings
 from .models import PoseEstimationResponse, ProcessingStatus, ConfidenceMetrics, Keypoint, VideoRenderingResponse, MovementAnalysisResponse
 from .video import VideoProcessor
-from .video.renderer import EnhancedVideoRenderer, RenderingConfig
+from .video.renderer import VideoRenderer, RenderingConfig
 from .utils.video_file_manager import VideoFileManager
 from .pose.mediapipe_estimator import MediaPipeEstimator
 from .pose.movement_analyzer import MovementAnalyzer
@@ -220,7 +220,7 @@ async def render_video(
             draw_motion_trails=draw_motion_trails,
             render_mode=render_mode
         )
-        video_renderer = EnhancedVideoRenderer(render_config)
+        video_renderer = VideoRenderer(render_config)
         
         # Store frames and keypoints for rendering
         all_frames = []
@@ -440,7 +440,7 @@ async def process_complete_video(
             draw_motion_trails=True,
             render_mode=render_mode
         )
-        video_renderer = EnhancedVideoRenderer(render_config)
+        video_renderer = VideoRenderer(render_config)
         
         # Store frames and keypoints for processing
         all_frames = []
