@@ -412,6 +412,8 @@ async def process_complete_video(
     analyzes movement patterns, and returns all results
     """
     processing_start = time.time()
+    # Initialize video_processor to None here to ensure it's defined
+    video_processor = None
     
     try:
         # Initialize components

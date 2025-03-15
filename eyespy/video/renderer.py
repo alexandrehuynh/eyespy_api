@@ -13,6 +13,7 @@ from ..config import settings
 from ..utils.executor_service import get_executor
 from ..utils.async_utils import run_in_executor, gather_with_concurrency
 from ..pose.validation import PoseValidator
+import psutil
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -52,10 +53,19 @@ class RenderingConfig:
     
     # Video output settings
     render_mode: str = "standard"  # "standard", "wireframe", "analysis", "xray"
+    
+    # Optimization settings
+    use_parallel_rendering: bool = True
+    max_parallel_frames: int = 8  # Maximum number of frames to render in parallel
+    use_frame_caching: bool = True  # Cache rendered elements for performance
 
     def __post_init__(self):
         """Create output directory if it doesn't exist"""
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Auto-tune rendering workers based on system
+        cpu_count = psutil.cpu_count(logical=False) or 4
+        self.max_parallel_frames = min(cpu_count * 2, 12)
 
 
 class VideoRenderer:
@@ -101,6 +111,15 @@ class VideoRenderer:
         
         # Store motion history for trails
         self.motion_trails = {}
+        
+        # Cache for rendered elements
+        self.cached_angles = {}
+        self.cached_keypoints = {}
+        self.cached_joints = {}
+        
+        # Set optimal number of parallel renderers
+        self.max_render_workers = self.config.max_parallel_frames
+        logger.info(f"VideoRenderer initialized with {self.max_render_workers} parallel rendering workers")
         
     async def render_video(
         self,
@@ -153,152 +172,188 @@ class VideoRenderer:
             (width, height)
         )
         
-        try:
-            # Process frames in batches to optimize performance
-            total_frames = len(frames)
-            batch_size = self.config.batch_size
+        if not writer.isOpened():
+            logger.error(f"Failed to open VideoWriter at {output_path}")
+            raise ValueError(f"Failed to open VideoWriter at {output_path}")
             
+        logger.info(f"Created video writer with fps={fps}, size={width}x{height}")
+        
+        # Render frames in batches for better memory management
+        total_frames = len(frames)
+        frames_written = 0
+        batch_size = self.config.batch_size
+        
+        try:
             for i in range(0, total_frames, batch_size):
-                batch_frames = frames[i:i + batch_size]
-                batch_keypoints = keypoints_per_frame[i:i + batch_size]
+                batch_start = time.time()
+                end_idx = min(i + batch_size, total_frames)
+                batch_frames = frames[i:end_idx]
+                batch_keypoints = keypoints_per_frame[i:end_idx]
                 
-                # Render batch in parallel based on render mode
+                logger.info(f"Rendering batch {i//batch_size + 1}/{(total_frames+batch_size-1)//batch_size}")
+                
+                # Render batch with the appropriate mode
                 if actual_render_mode == "wireframe":
                     rendered_frames = await self._render_wireframe_batch(batch_frames, batch_keypoints)
                 elif actual_render_mode == "analysis":
                     rendered_frames = await self._render_analysis_batch(batch_frames, batch_keypoints)
                 elif actual_render_mode == "xray":
                     rendered_frames = await self._render_xray_batch(batch_frames, batch_keypoints)
-                else:  # "standard" or fallback
+                else:
+                    # Default standard rendering
                     rendered_frames = await self._render_batch(batch_frames, batch_keypoints)
                 
-                # Write frames to video
+                # Write rendered frames
                 for frame in rendered_frames:
-                    writer.write(frame)
+                    await run_in_executor(writer.write, frame)
+                    frames_written += 1
                 
-                logger.debug(f"Rendered batch {i // batch_size + 1}/{(total_frames + batch_size - 1) // batch_size}")
+                batch_time = time.time() - batch_start
+                frames_per_second = len(rendered_frames) / batch_time if batch_time > 0 else 0
+                logger.info(f"Rendered {len(rendered_frames)} frames in {batch_time:.2f}s ({frames_per_second:.1f} FPS)")
                 
-                # Free memory
+                # Free memory explicitly
+                del rendered_frames
                 del batch_frames
                 del batch_keypoints
-                del rendered_frames
                 
-                # Yield control to allow other tasks to run
-                await asyncio.sleep(0)
+                # Small delay to prevent event loop congestion
+                await asyncio.sleep(0.001)
+                
+            # Release writer
+            await run_in_executor(writer.release)
             
-            logger.info(f"Video rendering completed in {time.time() - start_time:.2f} seconds")
+            # Log rendering stats
+            total_time = time.time() - start_time
+            logger.info(f"Video rendering completed in {total_time:.2f}s")
+            logger.info(f"Output: {output_path}")
+            
             return str(output_path)
             
-        finally:
-            writer.release()
-    
+        except Exception as e:
+            logger.error(f"Error rendering video: {str(e)}")
+            
+            # Ensure writer is released
+            if writer.isOpened():
+                await run_in_executor(writer.release)
+                
+            raise
+
     async def _render_batch(
         self,
         batch_frames: List[np.ndarray],
         batch_keypoints: List[List[Keypoint]]
     ) -> List[np.ndarray]:
         """
-        Render a batch of frames sequentially with standard skeleton overlay
-        
-        Args:
-            frames: List of frames to render
-            keypoints_per_frame: List of keypoints for each frame
-            
-        Returns:
-            List of rendered frames
+        Render a batch of frames with their keypoints in parallel
         """
-        rendered_frames = []
-    
-        # Process each frame sequentially instead of concurrently
-        for i, (frame, keypoints) in enumerate(zip(batch_frames, batch_keypoints)):
-            rendered_frame = await self._render_frame(frame, keypoints)
-            rendered_frames.append(rendered_frame)
-            
-            # Small delay to yield control
-            await asyncio.sleep(0.001)
+        render_tasks = []
         
-        return rendered_frames
-    
+        # Create a render task for each frame
+        for i, (frame, keypoints) in enumerate(zip(batch_frames, batch_keypoints)):
+            task = self._render_frame(frame, keypoints)
+            render_tasks.append(task)
+            
+        # Process frames in parallel with concurrency limit
+        if self.config.use_parallel_rendering:
+            return await gather_with_concurrency(
+                self.max_render_workers,  # Limit concurrent rendering
+                *render_tasks
+            )
+        else:
+            # Sequential rendering (fallback)
+            rendered_frames = []
+            for task in render_tasks:
+                rendered_frame = await task
+                rendered_frames.append(rendered_frame)
+            return rendered_frames
+
     async def _render_wireframe_batch(
         self,
         frames: List[np.ndarray],
         keypoints_per_frame: List[List[Keypoint]]
     ) -> List[np.ndarray]:
         """
-        Render a batch of frames with wireframe visualization
-        
-        Args:
-            frames: List of frames to render
-            keypoints_per_frame: List of keypoints for each frame
-            
-        Returns:
-            List of rendered frames
+        Render a batch of frames with wireframe visualization in parallel
         """
-        # Similar to _render_batch but using wireframe rendering
         render_tasks = []
         
-        for frame, keypoints in zip(frames, keypoints_per_frame):
-            task = self._render_wireframe_frame(frame.copy(), keypoints)
+        # Create a render task for each frame
+        for i, (frame, keypoints) in enumerate(zip(frames, keypoints_per_frame)):
+            task = self._render_wireframe_frame(frame, keypoints)
             render_tasks.append(task)
-        
-        return await gather_with_concurrency(
-            self.config.max_workers,
-            *render_tasks
-        )
-    
+            
+        # Process frames in parallel with concurrency limit
+        if self.config.use_parallel_rendering:
+            return await gather_with_concurrency(
+                self.max_render_workers,
+                *render_tasks
+            )
+        else:
+            # Sequential rendering (fallback)
+            rendered_frames = []
+            for task in render_tasks:
+                rendered_frame = await task
+                rendered_frames.append(rendered_frame)
+            return rendered_frames
+
     async def _render_analysis_batch(
         self,
         frames: List[np.ndarray],
         keypoints_per_frame: List[List[Keypoint]]
     ) -> List[np.ndarray]:
         """
-        Render a batch of frames with detailed analysis visualization
-        
-        Args:
-            frames: List of frames to render
-            keypoints_per_frame: List of keypoints for each frame
-            
-        Returns:
-            List of rendered frames
+        Render a batch of frames with analysis visualization in parallel
         """
-        # Similar to _render_batch but using analysis rendering
         render_tasks = []
         
-        for frame, keypoints in zip(frames, keypoints_per_frame):
-            task = self._render_analysis_frame(frame.copy(), keypoints)
+        # Create a render task for each frame
+        for i, (frame, keypoints) in enumerate(zip(frames, keypoints_per_frame)):
+            task = self._render_analysis_frame(frame, keypoints)
             render_tasks.append(task)
-        
-        return await gather_with_concurrency(
-            self.config.max_workers,
-            *render_tasks
-        )
-    
+            
+        # Process frames in parallel with concurrency limit
+        if self.config.use_parallel_rendering:
+            return await gather_with_concurrency(
+                self.max_render_workers,
+                *render_tasks
+            )
+        else:
+            # Sequential rendering (fallback)
+            rendered_frames = []
+            for task in render_tasks:
+                rendered_frame = await task
+                rendered_frames.append(rendered_frame)
+            return rendered_frames
+
     async def _render_xray_batch(
         self,
         frames: List[np.ndarray],
         keypoints_per_frame: List[List[Keypoint]]
     ) -> List[np.ndarray]:
         """
-        Render a batch of frames with X-ray style visualization
-        
-        Args:
-            frames: List of frames to render
-            keypoints_per_frame: List of keypoints for each frame
-            
-        Returns:
-            List of rendered frames
+        Render a batch of frames with xray visualization in parallel
         """
-        # Similar to _render_batch but using X-ray rendering
         render_tasks = []
         
-        for frame, keypoints in zip(frames, keypoints_per_frame):
-            task = self._render_xray_frame(frame.copy(), keypoints)
+        # Create a render task for each frame
+        for i, (frame, keypoints) in enumerate(zip(frames, keypoints_per_frame)):
+            task = self._render_xray_frame(frame, keypoints)
             render_tasks.append(task)
-        
-        return await gather_with_concurrency(
-            self.config.max_workers,
-            *render_tasks
-        )
+            
+        # Process frames in parallel with concurrency limit
+        if self.config.use_parallel_rendering:
+            return await gather_with_concurrency(
+                self.max_render_workers,
+                *render_tasks
+            )
+        else:
+            # Sequential rendering (fallback)
+            rendered_frames = []
+            for task in render_tasks:
+                rendered_frame = await task
+                rendered_frames.append(rendered_frame)
+            return rendered_frames
     
     async def _render_frame(
         self,
@@ -340,35 +395,38 @@ class VideoRenderer:
         if not keypoints:
             return frame
         
+        # Make a copy of the frame to avoid modifying the original
+        rendered_frame = frame.copy()
+        
         # Convert keypoints to dictionary for easier access
         keypoint_dict = {kp.name: kp for kp in keypoints}
         
         # Draw skeleton
-        self._draw_skeleton(frame, keypoint_dict)
+        self._draw_skeleton(rendered_frame, keypoint_dict)
         
         # Draw joints
-        self._draw_joints(frame, keypoint_dict)
+        self._draw_joints(rendered_frame, keypoint_dict)
         
         # Draw angles
         if self.config.show_angles:
-            angle_results = self._draw_angles(frame, keypoint_dict)
+            angle_results = self._draw_angles(rendered_frame, keypoint_dict)
             
             # Add analytics based on angles
-            self._add_analytics_text(frame, angle_results)
+            self._add_analytics_text(rendered_frame, angle_results)
         
         # Optional: Draw motion trails
         if self.config.draw_motion_trails:
-            frame = self._draw_motion_trails(frame, keypoint_dict)
+            rendered_frame = self._draw_motion_trails(rendered_frame, keypoint_dict)
             
         # Optional: Draw pelvis origin
         if self.config.draw_pelvis_origin:
-            frame = self._draw_pelvis_origin(frame, keypoint_dict)
+            rendered_frame = self._draw_pelvis_origin(rendered_frame, keypoint_dict)
             
         # Optional: Draw spine overlay
         if self.config.draw_spine_overlay:
-            frame = self._draw_spine_overlay(frame, keypoint_dict)
+            rendered_frame = self._draw_spine_overlay(rendered_frame, keypoint_dict)
         
-        return frame
+        return rendered_frame
     
     async def _render_wireframe_frame(
         self,
@@ -416,8 +474,8 @@ class VideoRenderer:
                 # Draw bright lines
                 cv2.line(wireframe, p1_px, p2_px, (0, 255, 255), 3)
         
-        # Draw joints
-        for name, kp in keypoint_dict.items():
+        # Draw joints - use a list of items() to avoid modifying during iteration
+        for name, kp in list(keypoint_dict.items()):
             if kp.confidence < 0.5:
                 continue
                 
@@ -429,7 +487,7 @@ class VideoRenderer:
             
         # Add angles for key joints
         angle_results = self._calculate_angles(keypoint_dict)
-        for joint_name, angle in angle_results.items():
+        for joint_name, angle in list(angle_results.items()):
             if "elbow" in joint_name or "knee" in joint_name:
                 landmark_name = joint_name.replace("left_", "LEFT_").replace("right_", "RIGHT_").replace("elbow", "ELBOW").replace("knee", "KNEE")
                 if landmark_name in keypoint_dict:
@@ -459,8 +517,9 @@ class VideoRenderer:
         keypoints: List[Keypoint]
     ) -> np.ndarray:
         """Analysis visualization (combination of standard and additional metrics)"""
-        # First draw standard skeleton
-        rendered = self._render_frame_sync(frame, keypoints)
+        # First draw standard skeleton - make a copy to avoid modifying original frame
+        frame_copy = frame.copy()
+        rendered = self._render_frame_sync(frame_copy, keypoints)
         
         # Skip if no keypoints
         if not keypoints:
@@ -470,7 +529,7 @@ class VideoRenderer:
         keypoint_dict = {kp.name: kp for kp in keypoints}
         
         # Add large analytics panel
-        height, width = frame.shape[:2]
+        height, width = rendered.shape[:2]
         overlay = rendered.copy()
         cv2.rectangle(overlay, (width-350, 0), (width, 400), (0, 0, 0), -1)
         alpha = 0.7
@@ -483,9 +542,9 @@ class VideoRenderer:
         cv2.putText(rendered, "MOVEMENT ANALYSIS", (width-340, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
-        # Joint angles
+        # Joint angles - use a list of items() to avoid modifying during iteration
         y_offset = 70
-        for joint, angle in angles.items():
+        for joint, angle in list(angles.items()):
             color = (0, 255, 0) if self._is_angle_in_range(joint, angle) else (0, 0, 255)
             cv2.putText(rendered, f"{joint}: {angle:.1f}", (width-340, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
@@ -559,8 +618,8 @@ class VideoRenderer:
                 # Draw thick bright lines
                 cv2.line(skeleton_canvas, p1_px, p2_px, (0, 255, 255), 4)
         
-        # Draw joints
-        for name, kp in keypoint_dict.items():
+        # Draw joints - use a list of items() to avoid modifying during iteration
+        for name, kp in list(keypoint_dict.items()):
             if kp.confidence < 0.4:
                 continue
                 
@@ -677,7 +736,10 @@ class VideoRenderer:
         """
         height, width = frame.shape[:2]
         
-        for p1_name, p2_name in self.skeleton_connections:
+        # Create a copy of the skeleton connections list to avoid modification issues
+        connections_to_draw = list(self.skeleton_connections)
+        
+        for p1_name, p2_name in connections_to_draw:
             if p1_name in keypoint_dict and p2_name in keypoint_dict:
                 p1 = keypoint_dict[p1_name]
                 p2 = keypoint_dict[p2_name]
@@ -716,7 +778,10 @@ class VideoRenderer:
         """
         height, width = frame.shape[:2]
         
-        for name, keypoint in keypoint_dict.items():
+        # Create a copy of the dictionary items to avoid modification issues
+        joints_to_draw = list(keypoint_dict.items())
+        
+        for name, keypoint in joints_to_draw:
             # Skip if confidence is too low
             if keypoint.confidence < 0.4:
                 continue
@@ -754,7 +819,10 @@ class VideoRenderer:
         height, width = frame.shape[:2]
         angle_results = {}
         
-        for angle_name, (p1_name, p2_name, p3_name) in self.angle_definitions.items():
+        # Create a copy of the angle definitions to avoid modification issues
+        angle_defs_to_process = list(self.angle_definitions.items())
+        
+        for angle_name, (p1_name, p2_name, p3_name) in angle_defs_to_process:
             if all(p_name in keypoint_dict for p_name in [p1_name, p2_name, p3_name]):
                 p1 = keypoint_dict[p1_name]
                 p2 = keypoint_dict[p2_name]
@@ -798,6 +866,9 @@ class VideoRenderer:
         """
         height, width = frame.shape[:2]
         
+        # Create a copy of angle_results to avoid modification during iteration
+        angle_results_copy = dict(angle_results)
+        
         # Create a semi-transparent overlay for text background
         overlay = frame.copy()
         cv2.rectangle(
@@ -823,14 +894,16 @@ class VideoRenderer:
             self.config.font_thickness
         )
         
-        # Add analytics for each joint type
+        # Add analytics for each joint type - use predefined list to avoid modification issues
+        joint_types = ["elbow", "knee", "hip", "shoulder"]
+        
         y_offset = 40
-        for joint_type in ["elbow", "knee", "hip", "shoulder"]:
+        for joint_type in joint_types:
             # Check relevant angles
             assessment = "N/A"
             
             # Look for corresponding angles (e.g., left_elbow, right_elbow for "elbow")
-            angles = [angle_results.get(f"left_{joint_type}"), angle_results.get(f"right_{joint_type}")]
+            angles = [angle_results_copy.get(f"left_{joint_type}"), angle_results_copy.get(f"right_{joint_type}")]
             angles = [a for a in angles if a is not None]
             
             if angles:
@@ -878,7 +951,7 @@ class VideoRenderer:
             )
             
             y_offset += 20
-        
+    
     def _draw_motion_trails(
         self,
         frame: np.ndarray,
@@ -918,8 +991,11 @@ class VideoRenderer:
                 if len(self.motion_trails[point_name]) > self.config.batch_size:
                     self.motion_trails[point_name].pop(0)
         
+        # Create a copy of the motion trails dictionary before iterating
+        trails_to_draw = dict(self.motion_trails)
+        
         # Draw trails
-        for point_name, trail in self.motion_trails.items():
+        for point_name, trail in trails_to_draw.items():
             if len(trail) >= 2:
                 for i in range(1, len(trail)):
                     # Fade color based on position in trail
